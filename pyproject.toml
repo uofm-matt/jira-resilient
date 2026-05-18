@@ -9,7 +9,7 @@ description = "Resilient JIRA Server data extraction at scale — seek paginatio
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
-authors = [{ name = "Matt Gargett" }]
+authors = [{ name = "uofm-matt" }]
 keywords = ["jira", "jira-server", "pagination", "etl", "data-warehouse"]
 classifiers = [
     "Development Status :: 4 - Beta",
