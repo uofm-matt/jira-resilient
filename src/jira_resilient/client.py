@@ -36,14 +36,16 @@ _MINIMAL_FIELDS = (
 class JiraClient:
     """Resilient JIRA Server REST client with seek pagination and reindex-aware recovery.
 
-    Example:
-        >>> from jira_resilient import JiraClient
-        >>> client = JiraClient("https://jira.example.com", pat="...")
-        >>> if not client.is_authenticated:
-        ...     raise SystemExit("auth failed")
-        >>> for page in client.search_seek("PROJ"):
-        ...     for issue in page.issues:
-        ...         ...
+    Example (illustrative only — see tests/ for live-network-free executable examples)::
+
+        from jira_resilient import JiraClient
+
+        client = JiraClient("https://jira.example.com", pat="...")
+        if not client.is_authenticated:
+            raise SystemExit("auth failed")
+        for page in client.search_seek("PROJ"):
+            for issue in page.issues:
+                ...
     """
 
     def __init__(

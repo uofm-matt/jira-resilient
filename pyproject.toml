@@ -46,5 +46,6 @@ select = ["E", "W", "F", "I", "B", "C4", "SIM", "RET", "UP", "RUF"]
 ignore = ["E501"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "src/jira_resilient"]
+addopts = "--doctest-modules"
 filterwarnings = ["error"]
