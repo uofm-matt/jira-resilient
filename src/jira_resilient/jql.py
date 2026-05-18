@@ -48,10 +48,10 @@ def build_jql(
     `updated_after` accepts ISO-8601-ish strings; JQL only honors minute precision,
     so the string is truncated to 16 chars and any `T` becomes a space.
 
-    >>> build_jql("DMDHMSM")
-    'project = "DMDHMSM" ORDER BY updated ASC'
-    >>> build_jql("DMDHMSM", updated_after="2026-05-18T07:30:00")
-    'project = "DMDHMSM" AND updated >= "2026-05-18 07:30" ORDER BY updated ASC'
+    >>> build_jql("PROJ")
+    'project = "PROJ" ORDER BY updated ASC'
+    >>> build_jql("PROJ", updated_after="2026-05-18T07:30:00")
+    'project = "PROJ" AND updated >= "2026-05-18 07:30" ORDER BY updated ASC'
     """
     _check_project_key(project_key)
     base = f'project = "{project_key}"'
@@ -83,8 +83,8 @@ def build_seek_jql(
 
     >>> from datetime import datetime, timezone
     >>> ts = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
-    >>> build_seek_jql("DMDHMSM", after_ts=ts, after_key="DMDHMSM-100")
-    'project = "DMDHMSM" AND (updated > "2026-05-18 07:30" OR (updated = "2026-05-18 07:30" AND key > "DMDHMSM-100")) ORDER BY updated ASC, key ASC'
+    >>> build_seek_jql("PROJ", after_ts=ts, after_key="PROJ-100")
+    'project = "PROJ" AND (updated > "2026-05-18 07:30" OR (updated = "2026-05-18 07:30" AND key > "PROJ-100")) ORDER BY updated ASC, key ASC'
     """
     _check_project_key(project_key)
     base = f'project = "{project_key}"'

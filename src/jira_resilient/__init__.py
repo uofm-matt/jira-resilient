@@ -10,12 +10,12 @@ Quickstart:
 
     # Seek-paginated scan of a large project — survives 100K+ issue projects
     # where offset pagination dies.
-    for page in client.search_seek("DMDHMSM"):
+    for page in client.search_seek("PROJ"):
         for issue in page.issues:
             ...
 
     # Three-tier resilient fetch (full → hub-fetch → minimal fallback)
-    result = client.get_issue_resilient("DMDHMSM-43133")
+    result = client.get_issue_resilient("HUB-1234")
     print(result.tier, result.issue["key"])
 """
 from jira_resilient._models     import ResilientFetchResult, SearchPage, Tier

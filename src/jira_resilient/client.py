@@ -41,7 +41,7 @@ class JiraClient:
         >>> client = JiraClient("https://jira.example.com", pat="...")
         >>> if not client.is_authenticated:
         ...     raise SystemExit("auth failed")
-        >>> for page in client.search_seek("DMDHMSM"):
+        >>> for page in client.search_seek("PROJ"):
         ...     for issue in page.issues:
         ...         ...
     """
