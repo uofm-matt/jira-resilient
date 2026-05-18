@@ -4,6 +4,7 @@ All library-raised exceptions inherit from JiraResilientError, so callers can ca
 the whole family with one `except JiraResilientError` clause. Underlying
 `requests.RequestException` is wrapped (and chained via `from`) on fetch failures.
 """
+
 from __future__ import annotations
 
 

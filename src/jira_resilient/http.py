@@ -9,6 +9,7 @@ The retry policy distinguishes failure modes explicitly:
     - Network errors   — exponential backoff (different schedule than 5xx).
     - Everything else  — propagate.
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 class _TLSAdapter(HTTPAdapter):
     """Forces TLS 1.2+ minimum at the connection layer."""
 
-    def init_poolmanager(self, *args, **kwargs):  # noqa: D401
+    def init_poolmanager(self, *args, **kwargs):
         ctx = create_urllib3_context()
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         kwargs["ssl_context"] = ctx
@@ -73,15 +74,21 @@ def request_with_retry(
         try:
             resp = session.request(method, url, json=json, params=params, timeout=timeout)
             if resp.status_code == 429:
-                wait = 60 * (2 ** attempt)
-                logger.warning("Rate limited; sleeping %ds (attempt %d/%d)",
-                               wait, attempt + 1, max_attempts)
+                wait = 60 * (2**attempt)
+                logger.warning(
+                    "Rate limited; sleeping %ds (attempt %d/%d)", wait, attempt + 1, max_attempts
+                )
                 time.sleep(wait)
                 continue
             if resp.status_code in (502, 503, 504):
-                wait = 30 * (2 ** attempt)
-                logger.warning("Server error %d; sleeping %ds (attempt %d/%d)",
-                               resp.status_code, wait, attempt + 1, max_attempts)
+                wait = 30 * (2**attempt)
+                logger.warning(
+                    "Server error %d; sleeping %ds (attempt %d/%d)",
+                    resp.status_code,
+                    wait,
+                    attempt + 1,
+                    max_attempts,
+                )
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
