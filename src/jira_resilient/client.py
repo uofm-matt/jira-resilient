@@ -5,24 +5,25 @@ methods that are direct wrappers around JIRA Server REST endpoints. The seek
 paginator and the three-tier resilient fetch are the load-bearing features that
 distinguish this library from the generic JIRA wrappers on PyPI.
 """
+
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import datetime, timedelta
-from typing import Iterator
 
 import requests
 
 from jira_resilient._models import ResilientFetchResult, SearchPage
-from jira_resilient.exceptions import JiraAuthError, JiraFetchError, JiraParseError
+from jira_resilient.exceptions import JiraFetchError, JiraParseError
 from jira_resilient.http import make_session, request_with_retry
 from jira_resilient.jql import build_seek_jql
 
 logger = logging.getLogger(__name__)
 
-_LIST_KEYS_PAGE_SIZE   = 1000   # fields=key only — tiny payload, can ask for many
-_SEARCH_SEEK_PAGE_SIZE = 20     # fields=*all + changelog — keep small to avoid timeouts
-_SEARCH_PAGED_PAGE_SIZE = 50    # fields=*all without seek — older offset-paginated path
+_LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for many
+_SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
+_SEARCH_PAGED_PAGE_SIZE = 50  # fields=*all without seek — older offset-paginated path
 
 # Default minimal field set for the "minimal" fallback tier. Covers the JIRA core fields
 # most warehouse loaders care about; explicitly excludes description, comments,
@@ -57,10 +58,10 @@ class JiraClient:
         timeout: int = 120,
         max_attempts: int = 5,
     ):
-        self.base_url     = base_url.rstrip("/")
-        self.timeout      = timeout
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
         self.max_attempts = max_attempts
-        self.session      = make_session(pat, verify)
+        self.session = make_session(pat, verify)
 
     # ----- auth ---------------------------------------------------------------
 
@@ -92,7 +93,9 @@ class JiraClient:
         """`GET /issue/{key}`. Defaults to the full payload (`fields=*all` + changelog)."""
         url = f"{self.base_url}/rest/api/2/issue/{key}"
         return request_with_retry(
-            self.session, "GET", url,
+            self.session,
+            "GET",
+            url,
             params={"fields": fields, "expand": expand},
             timeout=timeout or self.timeout,
             max_attempts=max_attempts or self.max_attempts,
@@ -102,9 +105,12 @@ class JiraClient:
         """Fallback fetch with a small field set + short timeout. No changelog."""
         url = f"{self.base_url}/rest/api/2/issue/{key}"
         return request_with_retry(
-            self.session, "GET", url,
+            self.session,
+            "GET",
+            url,
             params={"fields": fields, "expand": "names,schema"},
-            timeout=60, max_attempts=3,
+            timeout=60,
+            max_attempts=3,
         ).json()
 
     def get_issuelinks(self, key: str, *, timeout: int = 600) -> list[dict]:
@@ -112,9 +118,12 @@ class JiraClient:
         thousands of links can take minutes to serialize."""
         url = f"{self.base_url}/rest/api/2/issue/{key}"
         data = request_with_retry(
-            self.session, "GET", url,
+            self.session,
+            "GET",
+            url,
             params={"fields": "issuelinks"},
-            timeout=timeout, max_attempts=2,
+            timeout=timeout,
+            max_attempts=2,
         ).json()
         return (data.get("fields") or {}).get("issuelinks") or []
 
@@ -131,9 +140,12 @@ class JiraClient:
         start_at = 0
         while True:
             data = request_with_retry(
-                self.session, "GET", url,
+                self.session,
+                "GET",
+                url,
                 params={"startAt": start_at, "maxResults": page_size},
-                timeout=60, max_attempts=3,
+                timeout=60,
+                max_attempts=3,
             ).json()
             page = data.get("values") or []
             histories.extend(page)
@@ -159,7 +171,10 @@ class JiraClient:
         except requests.RequestException as exc_full:
             try:
                 issue = self.get_issue(
-                    key, expand="names,schema", fields="*all,-issuelinks", **fast_fail,
+                    key,
+                    expand="names,schema",
+                    fields="*all,-issuelinks",
+                    **fast_fail,
                 )
                 issue.setdefault("fields", {})["issuelinks"] = self.get_issuelinks(key)
                 return ResilientFetchResult(issue, "hub")
@@ -196,8 +211,14 @@ class JiraClient:
                 "maxResults": _LIST_KEYS_PAGE_SIZE,
                 "fields": ["key"],
             }
-            data = request_with_retry(self.session, "POST", url, json=body,
-                                      timeout=self.timeout, max_attempts=self.max_attempts).json()
+            data = request_with_retry(
+                self.session,
+                "POST",
+                url,
+                json=body,
+                timeout=self.timeout,
+                max_attempts=self.max_attempts,
+            ).json()
             page = [i["key"] for i in data.get("issues", [])]
             keys.extend(page)
             start_at += len(page)
@@ -207,7 +228,9 @@ class JiraClient:
 
     # ----- pagination ---------------------------------------------------------
 
-    def search_paged(self, jql: str, *, page_size: int = _SEARCH_PAGED_PAGE_SIZE) -> Iterator[SearchPage]:
+    def search_paged(
+        self, jql: str, *, page_size: int = _SEARCH_PAGED_PAGE_SIZE
+    ) -> Iterator[SearchPage]:
         """Offset-paginated `/search` yielding SearchPage per page (with changelog/names/schema).
 
         Lower-cost than `search_seek` for ad-hoc queries against bounded result sets.
@@ -225,8 +248,14 @@ class JiraClient:
                 "fields": ["*all"],
                 "expand": ["changelog", "names", "schema"],
             }
-            data = request_with_retry(self.session, "POST", url, json=body,
-                                      timeout=self.timeout, max_attempts=self.max_attempts).json()
+            data = request_with_retry(
+                self.session,
+                "POST",
+                url,
+                json=body,
+                timeout=self.timeout,
+                max_attempts=self.max_attempts,
+            ).json()
             issues = data.get("issues", [])
             if not issues:
                 break
@@ -239,10 +268,10 @@ class JiraClient:
         self,
         project_key: str,
         *,
-        after_ts:     datetime | None = None,
-        after_key:    str | None = None,
+        after_ts: datetime | None = None,
+        after_key: str | None = None,
         extra_filter: str | None = None,
-        page_size:    int = _SEARCH_SEEK_PAGE_SIZE,
+        page_size: int = _SEARCH_SEEK_PAGE_SIZE,
     ) -> Iterator[SearchPage]:
         """Seek-paginated `/search`. Every request uses `startAt=0`.
 
@@ -271,8 +300,9 @@ class JiraClient:
         url = f"{self.base_url}/rest/api/2/search"
         prev_boundary: tuple[datetime, str] | None = None
         while True:
-            jql = build_seek_jql(project_key, after_ts=after_ts, after_key=after_key,
-                                 extra_filter=extra_filter)
+            jql = build_seek_jql(
+                project_key, after_ts=after_ts, after_key=after_key, extra_filter=extra_filter
+            )
             body = {
                 "jql": jql,
                 "startAt": 0,
@@ -280,18 +310,27 @@ class JiraClient:
                 "fields": ["*all"],
                 "expand": ["changelog", "names", "schema"],
             }
-            data = request_with_retry(self.session, "POST", url, json=body,
-                                      timeout=self.timeout, max_attempts=self.max_attempts).json()
+            data = request_with_retry(
+                self.session,
+                "POST",
+                url,
+                json=body,
+                timeout=self.timeout,
+                max_attempts=self.max_attempts,
+            ).json()
             issues = data.get("issues") or []
             if not issues:
                 break
 
             last = issues[-1]
             last_updated = (last.get("fields") or {}).get("updated")
-            last_key     = last.get("key")
+            last_key = last.get("key")
             try:
-                new_ts = (datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
-                          if last_updated else None)
+                new_ts = (
+                    datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                    if last_updated
+                    else None
+                )
             except (AttributeError, ValueError) as exc:
                 raise JiraParseError(
                     f"Could not parse `updated` timestamp from JIRA: {last_updated!r}"
@@ -312,5 +351,5 @@ class JiraClient:
             yield SearchPage(issues, data.get("names") or {}, data.get("schema") or {})
             prev_boundary = current_boundary
             # Monotonic floor — see the docstring for why.
-            after_ts  = new_ts if after_ts is None else max(after_ts, new_ts)
+            after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
             after_key = last_key

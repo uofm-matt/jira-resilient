@@ -3,6 +3,7 @@
 These are pure functions — no network calls, no state. They live separately from
 the JiraClient class so callers can compose JQL outside of any request flow.
 """
+
 from __future__ import annotations
 
 import re
@@ -41,7 +42,7 @@ def build_jql(
     project_key: str,
     *,
     updated_after: str | None = None,
-    extra_filter:  str | None = None,
+    extra_filter: str | None = None,
 ) -> str:
     """Build a project-scoped JQL with optional `updated >=` clause + extra filter.
 
@@ -67,8 +68,8 @@ def build_jql(
 def build_seek_jql(
     project_key: str,
     *,
-    after_ts:     datetime | str | None = None,
-    after_key:    str | None = None,
+    after_ts: datetime | str | None = None,
+    after_key: str | None = None,
     extra_filter: str | None = None,
 ) -> str:
     """Build a seek-pagination JQL using the `(updated, key)` tuple cursor.

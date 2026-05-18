@@ -1,4 +1,5 @@
 """Unit tests for HTTP foundation: session config + retry logic."""
+
 from __future__ import annotations
 
 import time
@@ -24,7 +25,7 @@ def test_make_session_mounts_tls_adapter():
     sess = make_session(pat="x")
     # Both schemes should resolve to the same _TLSAdapter instance.
     https_adapter = sess.get_adapter("https://example.com")
-    http_adapter  = sess.get_adapter("http://example.com")
+    http_adapter = sess.get_adapter("http://example.com")
     assert https_adapter is http_adapter
     assert https_adapter.max_retries is _RETRY
 
@@ -52,8 +53,7 @@ def test_request_with_retry_raises_4xx_immediately(monkeypatch):
 @responses.activate
 def test_request_with_retry_retries_on_network_error_then_succeeds(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
-    responses.add(responses.GET, "https://x/foo",
-                  body=requests.exceptions.ConnectionError("boom"))
+    responses.add(responses.GET, "https://x/foo", body=requests.exceptions.ConnectionError("boom"))
     responses.add(responses.GET, "https://x/foo", json={"ok": True}, status=200)
     sess = make_session(pat="x")
     assert request_with_retry(sess, "GET", "https://x/foo").json() == {"ok": True}

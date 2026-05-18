@@ -1,4 +1,5 @@
 """Lightweight return types — NamedTuples for attribute access without dataclass overhead."""
+
 from __future__ import annotations
 
 from typing import Literal, NamedTuple
@@ -14,8 +15,9 @@ class SearchPage(NamedTuple):
     are field-id keyed; consumers building a field catalog typically merge them
     across pages.
     """
+
     issues: list[dict]
-    names:  dict[str, str]
+    names: dict[str, str]
     schema: dict[str, dict]
 
 
@@ -28,5 +30,6 @@ class ResilientFetchResult(NamedTuple):
         - "hub"     — fields=*all,-issuelinks plus a separate issuelinks fetch
         - "minimal" — minimal field set (description + custom_fields lost)
     """
+
     issue: dict
-    tier:  Tier
+    tier: Tier
