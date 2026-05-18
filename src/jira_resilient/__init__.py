@@ -15,7 +15,7 @@ Quickstart:
             ...
 
     # Three-tier resilient fetch (full → hub-fetch → minimal fallback)
-    result = client.get_issue_resilient("PROJ-1234")
+    result = client.get_issue_resilient("HUB-1234")
     print(result.tier, result.issue["key"])
 """
 from jira_resilient._models     import ResilientFetchResult, SearchPage, Tier

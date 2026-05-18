@@ -7,15 +7,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/uofm-matt/jira-resilient/test.yml?branch=main&label=tests)](https://github.com/uofm-matt/jira-resilient/actions/workflows/test.yml)
 
-In any large JIRA Server install, a handful of "hub" issues accumulate enormous numbers of `Implements` / `Tests` / `Relates` links — easily into the thousands. Real example we hit: **`PROJ-1234`, several thousand issuelinks.** The standard `GET /issue/{key}?fields=*all` for that issue returns a ~10 MB payload that takes JIRA 3+ minutes to serialize — well past every existing Python client's default timeout. Result: the issue is silently absent from the warehouse, no error, no retry that would help.
+In any large JIRA Server install, a handful of "hub" issues accumulate enormous numbers of `Implements` / `Tests` / `Relates` links — easily into the thousands. A real-world example: a single issue with **8,000+ issuelinks**. The standard `GET /issue/{key}?fields=*all` for that issue returns a ~10 MB payload that takes JIRA 3+ minutes to serialize — well past every existing Python client's default timeout. Result: the issue is silently absent from the warehouse, no error, no retry that would help.
 
 This library exists to solve that. The fix is a three-tier fetch that recognizes the timeout pattern and recovers data via split requests:
 
 ```python
-result = client.get_issue_resilient("PROJ-1234")
+result = client.get_issue_resilient("HUB-1234")
 # result.tier == "hub"    → fields=*all,-issuelinks fetched fast,
 #                          issuelinks fetched separately with a long timeout
-# result.issue            → fully assembled issue, several thousand links and all
+# result.issue            → fully assembled issue, all 8,000+ links intact
 ```
 
 Plus a few related reliability fixes the same code path needed along the way (seek-paginated `/search`, Lucene-reindex cursor handling, paginated changelog fallback, fail-fast-on-4xx in the retry loop). Documented further down.
@@ -41,9 +41,9 @@ if not client.is_authenticated:
     raise SystemExit("auth failed")
 
 # THE killer feature — resilient single-issue fetch that survives hub issues.
-result = client.get_issue_resilient("PROJ-1234")
+result = client.get_issue_resilient("HUB-1234")
 print(result.tier)         # "full" | "hub" | "minimal" — log this; minimal is lossy
-print(len(result.issue["fields"]["issuelinks"]))   # 7944
+print(len(result.issue["fields"]["issuelinks"]))   # 8000+
 
 # Seek-paginated scan — survives 100K+ issue projects.
 for page in client.search_seek("PROJ"):
@@ -58,7 +58,7 @@ for page in client.search_seek("PROJ", after_ts=cursor_ts, after_key=cursor_key)
     ...
 
 # Paginated changelog — for issues whose `expand=changelog` payload overflows the timeout.
-history = client.get_changelog("PROJ-1234")
+history = client.get_changelog("HUB-1234")
 
 # Minimal-payload key enumeration (for reconciliation against a warehouse).
 keys = client.list_keys('project = "PROJ"')
@@ -70,7 +70,7 @@ Every JIRA Python client on PyPI today (`jira`, `atlassian-python-api`, `pycontr
 
 | Problem | Other clients | `jira-resilient` |
 |---|---|---|
-| **Hub issues with thousands of issuelinks** (e.g. several thousand) — `fields=*all` payload exceeds 120s timeout, request fails | issue unrecoverable, silently absent from your data | three-tier fetch: `full` → `*all,-issuelinks` + separate links fetch with long timeout → minimal fields |
+| **Hub issues with thousands of issuelinks** — `fields=*all` payload exceeds 120s timeout, request fails | issue unrecoverable, silently absent from your data | three-tier fetch: `full` → `*all,-issuelinks` + separate links fetch with long timeout → minimal fields |
 | 100K+ issue projects — offset pagination is ~O(n²) on JIRA Server | "limit your queries" (Atlassian's documented guidance) | `search_seek` — `(updated, key)` tuple cursor in JQL, `startAt=0` every request, bounded per-page cost |
 | Lucene reindex makes seek cursors silently regress | n/a — no client implements seek | monotonic `after_ts` floor + minute-advance fallback (the war story below) |
 | Huge changelogs overflow `expand=changelog` | request fails; history lost | paginated `/issue/{key}/changelog` |

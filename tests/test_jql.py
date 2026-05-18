@@ -22,7 +22,7 @@ class TestBuildJql:
         assert 'AND status = "Done"' in out
 
     def test_rejects_invalid_project_key(self):
-        for bad in ("PROJ", "PROJ-1", "x", "ABC DEF", ""):
+        for bad in ("proj", "PROJ-1", "x", "ABC DEF", ""):
             with pytest.raises(ValueError, match="Invalid project key"):
                 build_jql(bad)
 
