@@ -1,49 +1,18 @@
 # jira-resilient
 
-Resilient JIRA Server data extraction at scale. Seek pagination, reindex-aware
-recovery, and a three-tier resilient single-issue fetch — built to survive
-100K+ issue projects, hub issues with thousands of links, and the occasional
-server-side Lucene reindex.
+> A Python client for **JIRA Server** that survives 100K+ issue projects, hub issues with thousands of links, and the occasional Lucene reindex. A drop-in alternative to `atlassian-python-api` for **ETL / data-warehouse workloads**.
 
-## What problem this solves
+[![PyPI](https://img.shields.io/pypi/v/jira-resilient.svg)](https://pypi.org/project/jira-resilient/)
+[![Python](https://img.shields.io/pypi/pyversions/jira-resilient.svg)](https://pypi.org/project/jira-resilient/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://img.shields.io/github/actions/workflow/status/uofm-matt/jira-resilient/test.yml?branch=main&label=tests)](https://github.com/uofm-matt/jira-resilient/actions/workflows/test.yml)
 
-Every JIRA Server Python client on PyPI today (`jira`, `atlassian-python-api`,
-`pycontribs/jira`, …) uses **offset pagination** under the hood. JIRA Server's
-offset pagination materializes the full sort and skips `startAt` rows per
-request — cost grows roughly quadratically with project size. On a 150K issue
-project this is the difference between a 30-minute load and one that never
-finishes.
-
-JIRA Server's official guidance is "limit your queries." That isn't an answer
-when the warehouse needs every issue.
-
-This library implements three things that aren't in any other JIRA client:
-
-1. **Seek-paginated search** — `(updated, key)` tuple cursor in JQL itself; every
-   request uses `startAt=0`. Per-request cost bounded regardless of project size.
-2. **Lucene-reindex monotonic-`after_ts`** — survives the edge case where a
-   server-side reindex stamps many issues with a future indexed-`updated` that
-   diverges from `fields.updated`. Without this guard, the seek cursor regresses
-   and loops forever; we've watched it happen.
-3. **Three-tier resilient issue fetch** — `fields=*all` → `*all,-issuelinks`
-   plus a separate `issuelinks` fetch (long timeout) → minimal field set.
-   Recovers data from "hub" issues with thousands of links whose `*all` payload
-   consistently exceeds 120s.
-
-Plus a few smaller pieces of operational hardening: paginated changelog
-fallback for huge histories, fail-fast-on-4xx in the retry loop, and a JQL
-extra-filter injection guard.
+JIRA Server's `/search` endpoint uses offset pagination — cost grows roughly quadratically with project size. On a 150K-issue project this is the difference between a 30-minute extract and one that never finishes. Existing Python clients work around this with "limit your queries," which isn't an answer when a warehouse needs every row. This library implements seek pagination + a handful of related reliability fixes that aren't in any other JIRA library on PyPI today.
 
 ## Install
 
 ```bash
-pip install jira-resilient
-```
-
-Or with [uv](https://github.com/astral-sh/uv):
-
-```bash
-uv add jira-resilient
+pip install jira-resilient        # or:  uv add jira-resilient
 ```
 
 ## Quickstart
@@ -53,85 +22,75 @@ from jira_resilient import JiraClient
 
 client = JiraClient(
     base_url="https://jira.example.com",
-    pat="<your-personal-access-token>",
-    verify=True,                # path to CA bundle, True for system CAs, False to skip
+    pat="<personal-access-token>",
+    verify="/path/to/ca-bundle.pem",   # or True for system CAs, False to skip
 )
 
 if not client.is_authenticated:
     raise SystemExit("auth failed")
 
-# 1. Seek-paginated scan — survives 100K+ issue projects.
+# Seek-paginated scan — survives 100K+ issue projects.
 for page in client.search_seek("DMDHMSM"):
     for issue in page.issues:
         print(issue["key"], issue["fields"]["summary"])
 
-# 2. Delta scan — resume from a known (updated, key) boundary.
+# Delta scan — resume from a saved (updated, key) cursor.
 from datetime import datetime, timezone
 cursor_ts  = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
 cursor_key = "DMDHMSM-12345"
 for page in client.search_seek("DMDHMSM", after_ts=cursor_ts, after_key=cursor_key):
     ...
 
-# 3. Single-issue fetch with three-tier resilience (full → hub → minimal).
+# Three-tier resilient single-issue fetch (recovers from hub-issue timeouts).
 result = client.get_issue_resilient("DMDHMSM-43133")
-print(result.tier)         # "full" | "hub" | "minimal" — log this; minimal == lossy
-print(result.issue["key"])
+print(result.tier)    # "full" | "hub" | "minimal" — log this; minimal is lossy
 
-# 4. Pure-key enumeration (tiny payload, for reconciliation).
+# Minimal-payload key enumeration (for reconciliation against a warehouse).
 keys = client.list_keys('project = "DMDHMSM"')
 
-# 5. Paginated changelog (works on huge histories that overflow expand=changelog).
+# Paginated changelog — works on issues whose `expand=changelog` payload
+# overflows the 120s timeout.
 history = client.get_changelog("DMDHMSM-43133")
 ```
 
-## The Lucene reindex story
+## Why this exists
 
-If you only read one section of this README, read this. It's the bug that
-took a day to find and is the reason this library exists.
+Every JIRA Python client on PyPI today (`jira`, `atlassian-python-api`, `pycontribs/jira`) uses offset pagination under the hood and has no answer for these three problems:
 
-JIRA Server occasionally runs a Lucene reindex. After a reindex, the
-**indexed** `updated` timestamp on many issues is set to the reindex time. The
-issue document's `fields.updated` is unaffected.
+| Problem | Other clients | `jira-resilient` |
+|---|---|---|
+| 100K+ issue projects (offset cost is ~ O(n²)) | "limit your queries" | `search_seek` — per-request cost bounded regardless of project size |
+| Lucene-reindex monotonic-`after_ts` divergence | silently loops forever, scanning the same group | cursor floor + minute-advance fallback; documented below |
+| Hub issues w/ thousands of links time out on `*all` | request fails; issue unrecoverable | three-tier fetch: `full` → `*all,-issuelinks` + separate links fetch → minimal fields |
 
-If you run a seek-paginated loop, advancing the cursor by `fields.updated` of
-the last issue on each page, you eventually hit a reindexed group: thousands
-of issues whose `fields.updated` is some old date (say, 2024) but whose
-indexed-`updated` is yesterday. Your JQL says `updated > "old-date"`. JIRA's
-matcher uses the indexed value (yesterday), so it returns the whole reindexed
-group. Your seek cursor goes BACKWARD in time. Your next request says
-`updated > "even-older-date"`. It loops forever, scanning the same group.
+Plus a handful of smaller fixes: paginated `/issue/{key}/changelog` for huge histories, fail-fast-on-4xx in the retry loop (so a permission error doesn't waste 15 minutes of exponential backoff), and a JQL extra-filter injection guard.
 
-The fix: `after_ts` is kept **monotonically non-decreasing** —
-`after_ts = max(after_ts, new_ts)`. Combined with a minute-advance fallback
-that preserves `after_key`, same-Lucene-timestamp groups can be paged through
-by key alone, and the cursor can never regress.
+### The Lucene reindex story
 
-This library implements that fix in `search_seek`. The seek loop is documented
-in the source — see `client.py`.
+The bug that took a day to find, and the reason this library exists.
 
-## Reference
+JIRA Server occasionally runs a Lucene reindex. After the reindex, the **indexed** `updated` timestamp on many issues is set to the reindex time. The document's `fields.updated` is unaffected.
 
-### `JiraClient`
+If you run a seek-paginated loop, advancing the cursor by `fields.updated` of the last issue on each page, you eventually hit a reindexed group: thousands of issues whose `fields.updated` is some old date (say, 2024) but whose indexed-`updated` is yesterday. Your next JQL says `updated > "old-date"`. JIRA's matcher uses the **indexed** value, so it returns the whole reindexed group — and your cursor just went *backward in time*. Next request, even broader. Infinite loop, no error, just chewing through the same group forever.
 
-```python
-JiraClient(base_url, pat, *, verify=True, timeout=120, max_attempts=5)
-```
+The fix: `after_ts` is kept **monotonically non-decreasing** — `after_ts = max(after_ts, new_ts)`. Combined with a minute-advance fallback that preserves `after_key`, same-Lucene-timestamp groups page through cleanly by key alone, and the cursor can't regress. This is documented in [`client.py:search_seek`](src/jira_resilient/client.py).
 
-Constructor. Builds a `requests.Session` with TLS 1.2+ enforced, bearer-PAT
-auth, and a retry adapter for transient 5xx at the connection layer.
+## API reference
+
+`JiraClient(base_url, pat, *, verify=True, timeout=120, max_attempts=5)`
 
 | Method | Endpoint | Notes |
 |---|---|---|
-| `is_authenticated` (property) | `GET /myself` | Logs displayName on success |
-| `get_issue(key, *, expand, fields, timeout, max_attempts)` | `GET /issue/{key}` | Defaults to `fields=*all` + changelog |
+| `is_authenticated` (prop) | `GET /myself` | Logs displayName on success |
+| `get_issue(key, *, expand, fields, …)` | `GET /issue/{key}` | Defaults to `fields=*all` + changelog |
 | `get_issue_minimal(key)` | `GET /issue/{key}` | Small-field set, short timeout |
-| `get_issuelinks(key, *, timeout=600)` | `GET /issue/{key}` (fields=issuelinks) | Long timeout for hub issues |
+| `get_issuelinks(key, *, timeout=600)` | `GET /issue/{key}` | Long default timeout for hub issues |
 | `get_changelog(key, *, page_size=100)` | `GET /issue/{key}/changelog` | Paginated; survives huge histories |
 | `get_issue_resilient(key)` | three-tier | Returns `ResilientFetchResult(issue, tier)` |
 | `list_fields()` | `GET /field` | Full field catalog |
 | `list_keys(jql)` | `POST /search` (fields=key) | Tiny payload; for reconciliation |
 | `search_paged(jql, *, page_size=50)` | `POST /search` (offset) | Use sparingly — quadratic on large projects |
-| `search_seek(project_key, *, after_ts, after_key, extra_filter, page_size=20)` | `POST /search` (seek) | The killer feature; use this for project-wide enumeration |
+| `search_seek(project_key, *, after_ts, after_key, extra_filter, page_size=20)` | `POST /search` (seek) | **The killer feature.** Use this for project-wide enumeration. |
 
 ### Exceptions
 
@@ -144,40 +103,44 @@ from jira_resilient import (
 )
 ```
 
-`requests.RequestException` may still escape — anything we don't explicitly
-wrap. Catch `JiraResilientError` for library-raised failures or `Exception`
-for everything.
+`requests.RequestException` may still escape on conditions the library doesn't wrap. Catch `JiraResilientError` for library-raised failures, or `Exception` for everything.
 
 ### JQL helpers
-
-Available at the top level for callers who want to compose JQL without going
-through the client:
 
 ```python
 from jira_resilient import build_jql, build_seek_jql
 ```
 
-## Caveats
+Pure functions, no network calls — for callers that want to compose JQL outside of any request flow.
 
-- **JIRA Server / Data Center only.** JIRA Cloud uses a different API surface
-  (`/rest/api/3`) and offset semantics; this library is not tested against it.
-- **Personal Access Token auth only.** Basic auth is deprecated; OAuth/JWT
-  not supported here.
-- **No async.** A future minor version may add an `AsyncJiraClient`; for now
-  everything is synchronous.
-- **No automatic field-name semantic mapping.** `customfield_10016` stays
-  `customfield_10016` in the response — the library doesn't know your
-  semantic naming.
+## Non-goals
+
+- **JIRA Cloud is not supported.** Cloud uses `/rest/api/3` and different paging semantics; this library is JIRA Server / Data Center only.
+- **No async client.** `JiraClient` is synchronous. An `AsyncJiraClient` may land in a future minor version.
+- **Basic auth, OAuth, and JWT are not supported.** Personal Access Token (Bearer header) only — that's what modern JIRA Server installs use.
+- **No automatic field-name semantic mapping.** `customfield_10016` stays `customfield_10016` in the response. Build your own mapping at the application layer if you need one.
+- **No DB / warehouse integration.** This is a JIRA client, not an ETL framework. Wire it up to your warehouse yourself.
+- **Not a replacement for `atlassian-python-api`'s full surface.** This is a focused client for the data-extraction subset.
+
+## Compatibility
+
+| | Version |
+|---|---|
+| Python | 3.12+ |
+| JIRA Server / Data Center | 8.6+ (for paginated `/issue/{key}/changelog`); older may work for non-changelog use |
+| `requests` | 2.31+ |
 
 ## Development
 
 ```bash
-git clone <repo>
+git clone https://github.com/uofm-matt/jira-resilient
 cd jira-resilient
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 pytest
 ```
+
+Tests run against mocked HTTP via [`responses`](https://github.com/getsentry/responses) — no real network. Run time: ~0.1s for the full suite.
 
 ## License
 
