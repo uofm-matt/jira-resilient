@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import requests
 
@@ -62,6 +62,7 @@ class JiraClient:
         self.timeout = timeout
         self.max_attempts = max_attempts
         self.session = make_session(pat, verify)
+        self._server_tz: tzinfo | None = None
 
     # ----- auth ---------------------------------------------------------------
 
@@ -78,6 +79,30 @@ class JiraClient:
             return True
         logger.error("Auth failed: HTTP %d", resp.status_code)
         return False
+
+    @property
+    def server_tz(self) -> tzinfo:
+        """JIRA server's local timezone, probed once from `/rest/api/2/serverInfo`.
+
+        JQL date literals like `"2026-05-19 13:00"` are parsed in *this* timezone, not
+        UTC. Pass to `build_jql`/`build_seek_jql` so a tz-aware cursor is rendered in
+        the timezone JIRA expects. `search_seek` does this automatically.
+
+        Falls back to UTC if `serverTime` can't be parsed — at worst that's the same
+        broken behavior callers had pre-fix.
+        """
+        if self._server_tz is None:
+            try:
+                resp = self.session.get(f"{self.base_url}/rest/api/2/serverInfo", timeout=30)
+                resp.raise_for_status()
+                server_time = resp.json().get("serverTime")
+                self._server_tz = datetime.fromisoformat(server_time).tzinfo
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                logger.warning("server_tz probe failed (%s) — falling back to UTC", exc)
+                self._server_tz = datetime.now().astimezone().tzinfo  # local; harmless when None
+            if self._server_tz is None:
+                self._server_tz = UTC
+        return self._server_tz
 
     # ----- single-issue fetches -----------------------------------------------
 
@@ -301,7 +326,8 @@ class JiraClient:
         prev_boundary: tuple[datetime, str] | None = None
         while True:
             jql = build_seek_jql(
-                project_key, after_ts=after_ts, after_key=after_key, extra_filter=extra_filter
+                project_key, after_ts=after_ts, after_key=after_key,
+                extra_filter=extra_filter, tz=self.server_tz,
             )
             body = {
                 "jql": jql,

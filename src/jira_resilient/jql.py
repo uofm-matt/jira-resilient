@@ -7,7 +7,7 @@ the JiraClient class so callers can compose JQL outside of any request flow.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, tzinfo
 
 # JIRA project keys: ASCII letter followed by 1-19 alphanumeric/underscore chars.
 _SAFE_PROJECT_KEY = re.compile(r"^[A-Z][A-Z0-9_]{1,19}$")
@@ -41,13 +41,19 @@ def _check_extra_filter(extra_filter: str) -> None:
 def build_jql(
     project_key: str,
     *,
-    updated_after: str | None = None,
+    updated_after: str | datetime | None = None,
     extra_filter: str | None = None,
+    tz: tzinfo | None = None,
 ) -> str:
     """Build a project-scoped JQL with optional `updated >=` clause + extra filter.
 
-    `updated_after` accepts ISO-8601-ish strings; JQL only honors minute precision,
-    so the string is truncated to 16 chars and any `T` becomes a space.
+    `updated_after` accepts ISO-8601 strings or `datetime` instances; JQL only honors
+    minute precision, so values are truncated to 16 chars.
+
+    JIRA Server's JQL date parser interprets bare `"YYYY-MM-DD HH:MM"` strings in the
+    JIRA server's local timezone — *not* UTC. If `tz` is given and `updated_after` is
+    a tz-aware datetime, it is converted to `tz` before formatting so the filter means
+    what the caller intended. Get JIRA's TZ via `JiraClient.server_tz`.
 
     >>> build_jql("PROJ")
     'project = "PROJ" ORDER BY updated ASC'
@@ -56,13 +62,20 @@ def build_jql(
     """
     _check_project_key(project_key)
     base = f'project = "{project_key}"'
-    if updated_after:
-        ts = updated_after.replace("T", " ")[:16]
+    if updated_after is not None:
+        ts = _fmt_jql_ts(updated_after, tz)
         base += f' AND updated >= "{ts}"'
     if extra_filter:
         _check_extra_filter(extra_filter)
         base += f" AND {extra_filter}"
     return base + " ORDER BY updated ASC"
+
+
+def _fmt_jql_ts(ts: str | datetime, tz: tzinfo | None) -> str:
+    """Render a timestamp as JIRA Server expects (`YYYY-MM-DD HH:MM`, JIRA-local TZ)."""
+    if isinstance(ts, datetime):
+        return (ts.astimezone(tz) if tz and ts.tzinfo else ts).strftime("%Y-%m-%d %H:%M")
+    return str(ts).replace("T", " ")[:16]
 
 
 def build_seek_jql(
@@ -71,6 +84,7 @@ def build_seek_jql(
     after_ts: datetime | str | None = None,
     after_key: str | None = None,
     extra_filter: str | None = None,
+    tz: tzinfo | None = None,
 ) -> str:
     """Build a seek-pagination JQL using the `(updated, key)` tuple cursor.
 
@@ -82,6 +96,10 @@ def build_seek_jql(
     are handled by the `key > after_key` tiebreaker and idempotent upserts
     downstream. See `JiraClient.search_seek` for the runtime handling.
 
+    JIRA Server interprets bare `"YYYY-MM-DD HH:MM"` JQL dates in its own local
+    timezone, not UTC. Pass `tz` (typically from `JiraClient.server_tz`) so a
+    tz-aware `after_ts` is converted before formatting.
+
     >>> from datetime import datetime, timezone
     >>> ts = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
     >>> build_seek_jql("PROJ", after_ts=ts, after_key="PROJ-100")
@@ -90,10 +108,7 @@ def build_seek_jql(
     _check_project_key(project_key)
     base = f'project = "{project_key}"'
     if after_ts:
-        if isinstance(after_ts, datetime):
-            ts = after_ts.strftime("%Y-%m-%d %H:%M")
-        else:
-            ts = str(after_ts)[:16].replace("T", " ")
+        ts = _fmt_jql_ts(after_ts, tz)
         if after_key:
             base += f' AND (updated > "{ts}" OR (updated = "{ts}" AND key > "{after_key}"))'
         else:
