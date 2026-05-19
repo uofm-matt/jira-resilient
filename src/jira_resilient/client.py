@@ -326,8 +326,11 @@ class JiraClient:
         prev_boundary: tuple[datetime, str] | None = None
         while True:
             jql = build_seek_jql(
-                project_key, after_ts=after_ts, after_key=after_key,
-                extra_filter=extra_filter, tz=self.server_tz,
+                project_key,
+                after_ts=after_ts,
+                after_key=after_key,
+                extra_filter=extra_filter,
+                tz=self.server_tz,
             )
             body = {
                 "jql": jql,

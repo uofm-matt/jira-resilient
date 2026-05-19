@@ -86,6 +86,8 @@ class TestBuildSeekJql:
 
     def test_tz_works_for_build_jql_too(self):
         utc_ts = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
-        et = timezone(offset=datetime(2026, 5, 18).astimezone(ZoneInfo("America/New_York")).utcoffset())
+        et = timezone(
+            offset=datetime(2026, 5, 18).astimezone(ZoneInfo("America/New_York")).utcoffset()
+        )
         out = build_jql("PROJ", updated_after=utc_ts, tz=et)
         assert '"2026-05-18 08:00"' in out
