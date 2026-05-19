@@ -9,6 +9,7 @@ distinguish this library from the generic JIRA wrappers on PyPI.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, tzinfo
 
@@ -323,7 +324,12 @@ class JiraClient:
         Raises `JiraParseError` if a returned issue is missing `fields.updated` or `key`.
         """
         url = f"{self.base_url}/rest/api/2/search"
-        prev_boundary: tuple[datetime, str] | None = None
+        # Last-N boundaries — detects longer cycles than the prev_boundary check.
+        # 3-key cycles within a single minute were observed in production on busy
+        # projects where JQL `updated > "X:Y"` (minute precision) re-matches every
+        # issue in the X:Y minute regardless of after_key. A simple prev-vs-current
+        # check misses these; a deque catches cycles of length up to maxlen-1.
+        recent_boundaries: deque[tuple[datetime, str]] = deque(maxlen=10)
         while True:
             jql = build_seek_jql(
                 project_key,
@@ -368,17 +374,18 @@ class JiraClient:
                 raise JiraParseError(f"Page ended with row missing updated/key: {last!r}")
 
             current_boundary = (new_ts, last_key)
-            if prev_boundary == current_boundary and after_ts is not None:
-                # Boundary repeat → either JQL minute-precision matched the boundary row
-                # twice, or a Lucene reindex is stamping many issues at one indexed-ts.
-                # Bump the minute; keep after_key so once after_ts reaches the indexed-ts
-                # the (updated = X AND key > Y) tiebreaker resumes paging through the
-                # same-timestamp group.
+            if current_boundary in recent_boundaries and after_ts is not None:
+                # Cycle detected (1-cycle = boundary repeat, N-cycle = same boundary seen
+                # within the last `maxlen` pages). Bump the minute past the current after_ts
+                # and clear after_key — the next iteration starts a fresh window at the new
+                # minute, no tiebreaker needed.
                 after_ts = (after_ts + timedelta(minutes=1)).replace(second=0, microsecond=0)
+                after_key = None
+                recent_boundaries.clear()
                 continue
 
             yield SearchPage(issues, data.get("names") or {}, data.get("schema") or {})
-            prev_boundary = current_boundary
+            recent_boundaries.append(current_boundary)
             # Monotonic floor — see the docstring for why.
             after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
             after_key = last_key

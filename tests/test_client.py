@@ -100,6 +100,50 @@ def test_search_seek_yields_pages(client, base_url):
 
 
 @responses.activate
+def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
+    """Regression: a 3-page cycle within one minute (JQL minute-precision matching every
+    issue in the minute regardless of after_key) used to spin forever. The deque-based
+    cycle detector forces a minute-advance once a boundary repeats within the last N pages.
+    """
+    ts = "2026-05-19T11:51:07.000-0400"
+    cycle_page = {
+        "issues": [
+            {"key": "XX-208847", "fields": {"updated": ts}},
+            {"key": "XX-209026", "fields": {"updated": ts}},
+            {"key": "XX-209073", "fields": {"updated": ts}},
+        ],
+        "names": {},
+        "schema": {},
+    }
+    after_page = {
+        "issues": [{"key": "XX-300", "fields": {"updated": "2026-05-19T11:53:00.000-0400"}}],
+        "names": {},
+        "schema": {},
+    }
+    empty_page = {"issues": [], "names": {}, "schema": {}}
+    # Same page returned 15 times — would loop forever pre-fix. After the deque trips,
+    # post-fix the loop advances a minute, JIRA returns `after_page`, then empty → done.
+    for _ in range(15):
+        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=cycle_page)
+    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=after_page)
+    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=empty_page)
+
+    from datetime import datetime
+
+    pages = list(
+        client.search_seek(
+            "XX",
+            after_ts=datetime.fromisoformat("2026-05-19T11:51:00+00:00"),
+            after_key="XX-200000",
+        )
+    )
+    # Pre-fix: spins forever → test times out. Post-fix: a bounded number of pages.
+    assert any(p.issues[0]["key"] == "XX-300" for p in pages), (
+        "should advance past the cycling minute to reach XX-300"
+    )
+
+
+@responses.activate
 def test_search_seek_raises_parse_error_on_missing_updated(client, base_url):
     responses.add(
         responses.POST,
