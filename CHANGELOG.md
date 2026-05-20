@@ -2,6 +2,53 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-05-19
+
+**Breaking change.** Inverted the default for single-issue fetches: the safe
+path is now `get_issue`; raw access moved to `get_issue_raw`. The library
+surface is now safe-by-default end-to-end — every JIRA read endpoint either
+routes through the three-tier hub fallback (`get_issue`, `search_seek`,
+`search_paged`) or is structurally immune to hub-issue timeouts (`list_keys`,
+`get_changelog`, `get_issue_minimal`, `get_issuelinks`).
+
+### Changed (breaking)
+- **`get_issue(key)` is now resilient.** It routes through
+  `get_issue_resilient` and returns the issue dict. Tier degradation is logged
+  as a warning. The old `get_issue(key, *, expand, fields, timeout,
+  max_attempts)` signature is now `get_issue_raw(...)`.
+- **`get_issue_raw(...)`** is the explicit escape hatch: no fallback, direct
+  pass-through to `request_with_retry`. Use when you need precise control over
+  fields/expand/timeout — autoheal fast-fail probes, changelog-only fetches with
+  a tight budget. `get_issue_resilient` uses this internally as its tier-1
+  building block.
+
+### Added
+- **`search_paged` resilient tier.** Mirrors the 0.1.3 fix in `search_seek` —
+  a single hub issue landing in an offset-paginated page no longer poisons the
+  whole query. `SearchPage.tier` is populated by both paginators.
+- Internal `_search_one_page` helper extracted so `search_seek` and
+  `search_paged` share the same three-tier logic. Returns `(data, tier)` and
+  accepts a `start_at` kwarg to support both pagination styles.
+
+### Migration
+
+```diff
+- result = client.get_issue("PROJ-123", expand="changelog", timeout=60)
++ result = client.get_issue_raw("PROJ-123", expand="changelog", timeout=60)
+
+- # If you only need the dict:
+- issue = client.get_issue("PROJ-123")
++ # Unchanged — same call, but now resilient under the hood.
++ issue = client.get_issue("PROJ-123")
+
+- # If you need tier info:
+- result = client.get_issue_resilient("PROJ-123")  # unchanged
++ result = client.get_issue_resilient("PROJ-123")
+```
+
+The most common pattern (no expand/timeout overrides) is **source-compatible**;
+only callers using the kwargs need to switch to `get_issue_raw`.
+
 ## [0.1.3] — 2026-05-19
 
 ### Added

@@ -411,3 +411,114 @@ def test_search_seek_hub_tier_tolerates_issuelinks_failure(client, base_url, mon
     assert pages[0].tier == "hub"
     # The issuelinks fetch failed, so we get an empty list, not a missing key.
     assert pages[0].issues[0]["fields"]["issuelinks"] == []
+
+
+# ----- API inversion (0.2.0): get_issue is resilient by default, raw is the escape hatch ---
+
+
+@responses.activate
+def test_get_issue_routes_through_resilient_tier(client, base_url, monkeypatch):
+    """0.2.0: get_issue() now routes through get_issue_resilient. Full tier times
+    out, hub tier supplements issuelinks separately, the caller still gets a dict
+    back (not a ResilientFetchResult) — the tier degradation is invisible to the
+    safe-default caller, logged as a warning for operators.
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    # Tier 1 (full) — 2 timeouts.
+    for _ in range(2):
+        responses.add(
+            responses.GET,
+            f"{base_url}/rest/api/2/issue/XX-1",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+    # Tier 2 (hub) — succeeds, with separate issuelinks supplement.
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1",
+        json={"key": "XX-1", "fields": {"summary": "ok"}},
+    )
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1",
+        json={"fields": {"issuelinks": [{"id": "1"}]}},
+    )
+
+    issue = client.get_issue("XX-1")
+    # Plain dict, not ResilientFetchResult — get_issue is the simple-default path.
+    assert isinstance(issue, dict)
+    assert issue["key"] == "XX-1"
+    assert issue["fields"]["issuelinks"] == [{"id": "1"}]
+
+
+@responses.activate
+def test_get_issue_raw_is_unguarded(client, base_url, monkeypatch):
+    """get_issue_raw is the explicit escape hatch — no fallback. A single
+    Timeout raises directly. Use it when you need precise timeout/field
+    control (e.g. autoheal fast-fail probes).
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    for _ in range(2):
+        responses.add(
+            responses.GET,
+            f"{base_url}/rest/api/2/issue/XX-1",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+
+    with pytest.raises(requests.exceptions.Timeout):
+        client.get_issue_raw("XX-1", timeout=60, max_attempts=2)
+
+
+# ----- search_paged tier fallback (0.2.0: now uses the same _search_one_page helper) ---
+
+
+@responses.activate
+def test_search_paged_falls_back_to_hub(client, base_url, monkeypatch):
+    """Mirror of test_search_seek_falls_back_to_hub — search_paged now shares
+    the same three-tier helper, so a single hub issue in the page no longer
+    poisons the offset-paginated path either.
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    # Tier 1: full times out.
+    for _ in range(2):
+        responses.add(
+            responses.POST,
+            f"{base_url}/rest/api/2/search",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+    # Tier 2: hub succeeds with one issue + a total of 1 (terminates the loop).
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "XX-1", "fields": {}}],
+            "names": {},
+            "schema": {},
+            "total": 1,
+        },
+    )
+    # issuelinks supplement.
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1",
+        json={"fields": {"issuelinks": [{"id": "9999"}]}},
+    )
+
+    pages = list(client.search_paged("project = XX"))
+    assert len(pages) == 1
+    assert pages[0].tier == "hub"
+    assert pages[0].issues[0]["fields"]["issuelinks"] == [{"id": "9999"}]

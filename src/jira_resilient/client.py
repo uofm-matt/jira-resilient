@@ -110,7 +110,20 @@ class JiraClient:
 
     # ----- single-issue fetches -----------------------------------------------
 
-    def get_issue(
+    def get_issue(self, key: str) -> dict:
+        """Resilient single-issue fetch — the default safe path.
+
+        Routes through `get_issue_resilient`'s three-tier fallback (full → hub
+        → minimal) and returns just the issue dict. Tier degradation is logged
+        as a warning. Use `get_issue_resilient` instead if you need to observe
+        which tier each fetch landed on; use `get_issue_raw` if you need direct
+        control over fields/expand/timeout (e.g. for fast-fail probes).
+
+        Raises `JiraFetchError` only if all three tiers fail.
+        """
+        return self.get_issue_resilient(key).issue
+
+    def get_issue_raw(
         self,
         key: str,
         *,
@@ -119,7 +132,13 @@ class JiraClient:
         timeout: int | None = None,
         max_attempts: int | None = None,
     ) -> dict:
-        """`GET /issue/{key}`. Defaults to the full payload (`fields=*all` + changelog)."""
+        """Raw `GET /issue/{key}` with no fallback. Escape hatch for callers
+        that need direct control — fast-fail probes (autoheal), changelog-only
+        fetches with a tight budget, etc. Most callers should use `get_issue`
+        instead, which routes through the resilient tier.
+
+        Defaults to the full payload (`fields=*all` + changelog).
+        """
         url = f"{self.base_url}/rest/api/2/issue/{key}"
         return request_with_retry(
             self.session,
@@ -195,11 +214,11 @@ class JiraClient:
         """
         fast_fail = {"timeout": 60, "max_attempts": 2}
         try:
-            issue = self.get_issue(key, expand="names,schema", **fast_fail)
+            issue = self.get_issue_raw(key, expand="names,schema", **fast_fail)
             return ResilientFetchResult(issue, "full")
         except requests.RequestException as exc_full:
             try:
-                issue = self.get_issue(
+                issue = self.get_issue_raw(
                     key,
                     expand="names,schema",
                     fields="*all,-issuelinks",
@@ -266,29 +285,18 @@ class JiraClient:
         For project-wide enumeration use `search_seek` instead — JIRA Server's offset
         pagination materializes the full sort and skips startAt rows per request, so
         the cost grows quadratically with project size.
+
+        Shares `_search_one_page` with `search_seek`, so the three-tier hub
+        fallback applies here too — a single mega-hub issue landing in the page
+        no longer poisons the entire query.
         """
-        url = f"{self.base_url}/rest/api/2/search"
         start_at = 0
         while True:
-            body = {
-                "jql": jql,
-                "startAt": start_at,
-                "maxResults": page_size,
-                "fields": ["*all"],
-                "expand": ["changelog", "names", "schema"],
-            }
-            data = request_with_retry(
-                self.session,
-                "POST",
-                url,
-                json=body,
-                timeout=self.timeout,
-                max_attempts=self.max_attempts,
-            ).json()
-            issues = data.get("issues", [])
+            data, tier = self._search_one_page(jql, page_size, start_at=start_at)
+            issues = data.get("issues") or []
             if not issues:
                 break
-            yield SearchPage(issues, data.get("names") or {}, data.get("schema") or {})
+            yield SearchPage(issues, data.get("names") or {}, data.get("schema") or {}, tier=tier)
             start_at += len(issues)
             if start_at >= data.get("total", 0):
                 break
@@ -340,7 +348,10 @@ class JiraClient:
                 extra_filter=extra_filter,
                 tz=self.server_tz,
             )
-            issues, names, schema, tier = self._search_one_page(jql, page_size)
+            data, tier = self._search_one_page(jql, page_size)
+            issues = data.get("issues") or []
+            names = data.get("names") or {}
+            schema = data.get("schema") or {}
             if not issues:
                 break
 
@@ -377,7 +388,7 @@ class JiraClient:
             after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
             after_key = last_key
 
-    def _search_one_page(self, jql: str, page_size: int) -> tuple[list[dict], dict, dict, Tier]:
+    def _search_one_page(self, jql: str, page_size: int, *, start_at: int = 0) -> tuple[dict, Tier]:
         """Three-tier `/search` request mirroring `get_issue_resilient`'s shape.
 
         Tier 1 (full):    `fields=["*all"]` + `expand=changelog,names,schema`.
@@ -390,27 +401,26 @@ class JiraClient:
                           the affected keys.
         Tier 3 (minimal): a small fixed field set (`_MINIMAL_FIELDS_LIST`); no
                           changelog, no issuelinks, no custom fields. Keeps the
-                          delta cursor advancing even when one page contains a
-                          truly pathological issue.
+                          cursor advancing even when one page contains a truly
+                          pathological issue.
 
-        Returns `(issues, names, schema, tier_used)` so the seek loop above can
-        yield `SearchPage(..., tier=tier_used)` and operators can observe the
-        degradation in logs.
+        Returns `(data, tier_used)` where `data` is the raw JIRA response dict
+        (callers need `issues`, `names`, `schema`, and `total` from it). The
+        `tier_used` lets seek/paged callers annotate their yielded SearchPage so
+        operators can observe degradation in logs.
+
+        `start_at` is used by offset-paginated callers (`search_paged`); seek
+        callers always pass `0` (default).
 
         Raises `JiraFetchError` only if all three tiers fail.
         """
         url = f"{self.base_url}/rest/api/2/search"
         fast_fail = {"timeout": 60, "max_attempts": 2}
-        base = {"jql": jql, "startAt": 0, "maxResults": page_size}
+        base = {"jql": jql, "startAt": start_at, "maxResults": page_size}
         try:
             body = base | {"fields": ["*all"], "expand": ["changelog", "names", "schema"]}
             data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
-            return (
-                data.get("issues") or [],
-                data.get("names") or {},
-                data.get("schema") or {},
-                "full",
-            )
+            return data, "full"
         except requests.RequestException as exc_full:
             logger.warning("search tier=full failed (%s); retrying without issuelinks", exc_full)
             try:
@@ -419,8 +429,7 @@ class JiraClient:
                     "expand": ["names", "schema"],
                 }
                 data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
-                issues = data.get("issues") or []
-                for issue in issues:
+                for issue in data.get("issues") or []:
                     key = issue.get("key")
                     if not key:
                         continue
@@ -434,12 +443,7 @@ class JiraClient:
                             exc_links,
                         )
                         issue.setdefault("fields", {})["issuelinks"] = []
-                return (
-                    issues,
-                    data.get("names") or {},
-                    data.get("schema") or {},
-                    "hub",
-                )
+                return data, "hub"
             except requests.RequestException as exc_hub:
                 logger.warning(
                     "search tier=hub failed (%s); falling back to minimal fields", exc_hub
@@ -452,12 +456,7 @@ class JiraClient:
                     data = request_with_retry(
                         self.session, "POST", url, json=body, **fast_fail
                     ).json()
-                    return (
-                        data.get("issues") or [],
-                        data.get("names") or {},
-                        data.get("schema") or {},
-                        "minimal",
-                    )
+                    return data, "minimal"
                 except requests.RequestException as exc_min:
                     raise JiraFetchError(
                         f"all three search tiers failed for jql={jql!r}: "
