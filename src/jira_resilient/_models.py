@@ -14,11 +14,18 @@ class SearchPage(NamedTuple):
     name (populated when the search was issued with `expand=names,schema`). Both
     are field-id keyed; consumers building a field catalog typically merge them
     across pages.
+
+    `tier` records WHICH tier the search request fell to when fetching this page
+    (mirrors `ResilientFetchResult.tier`). Defaults to "full"; degrades to "hub"
+    when a single hub issue's `issuelinks` blew the page payload, and "minimal"
+    when even that wasn't enough. Callers usually log the tier so operators see
+    which projects are tipping toward pathological.
     """
 
     issues: list[dict]
     names: dict[str, str]
     schema: dict[str, dict]
+    tier: Tier = "full"
 
 
 class ResilientFetchResult(NamedTuple):
