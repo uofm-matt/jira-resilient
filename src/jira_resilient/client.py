@@ -9,6 +9,7 @@ distinguish this library from the generic JIRA wrappers on PyPI.
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -16,7 +17,7 @@ from datetime import UTC, datetime, timedelta, tzinfo
 import requests
 
 from jira_resilient._models import ResilientFetchResult, SearchPage, Tier
-from jira_resilient.exceptions import JiraFetchError, JiraParseError
+from jira_resilient.exceptions import JiraFetchError, JiraJqlError, JiraParseError
 from jira_resilient.http import make_session, request_with_retry
 from jira_resilient.jql import build_seek_jql
 
@@ -25,6 +26,34 @@ logger = logging.getLogger(__name__)
 _LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for many
 _SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
 _SEARCH_PAGED_PAGE_SIZE = 50  # fields=*all without seek — older offset-paginated path
+
+# Matches JIRA's specific error when JQL `key > "X"` references a non-existent
+# issue. Seen in prod when an admin deletes an issue that happened to be a
+# previous cycle's seek-tiebreaker — every subsequent cycle then 400s forever
+# until the cursor key is cleared. We catch and auto-recover.
+_STALE_KEY_RE = re.compile(r"key '([^']+)' does not exist for field 'key'")
+
+
+def _is_http_400(exc: BaseException) -> bool:
+    """True if exc is a requests.HTTPError carrying a 400 response."""
+    return (
+        isinstance(exc, requests.HTTPError)
+        and exc.response is not None
+        and exc.response.status_code == 400
+    )
+
+
+def _jql_error_from(exc: requests.HTTPError, jql: str) -> JiraJqlError:
+    """Build a JiraJqlError from a 400 response, preserving JIRA's
+    `errorMessages` list verbatim for caller introspection."""
+    messages: list[str] = []
+    try:
+        body = exc.response.json() if exc.response is not None else {}
+        messages = list(body.get("errorMessages") or [])
+    except (ValueError, AttributeError):
+        pass
+    return JiraJqlError(f"JIRA rejected JQL: {jql!r}; messages={messages}", error_messages=messages)
+
 
 # Default minimal field set for the "minimal" fallback tier. Covers the JIRA core fields
 # most warehouse loaders care about; explicitly excludes description, comments,
@@ -333,6 +362,12 @@ class JiraClient:
            above, a reindexed same-timestamp group is paged through cleanly by key.
 
         Raises `JiraParseError` if a returned issue is missing `fields.updated` or `key`.
+
+        Self-heals from a stale `after_key` (JIRA-deleted between cycles) by
+        clearing the tiebreaker on the next iteration when JIRA returns a
+        400-with-"key 'X' does not exist". Without this the loop would 400
+        forever — every cycle rebuilds the same broken JQL from the same
+        stored cursor key.
         """
         # Last-N boundaries — detects longer cycles than the prev_boundary check.
         # 3-key cycles within a single minute were observed in production on busy
@@ -348,7 +383,22 @@ class JiraClient:
                 extra_filter=extra_filter,
                 tz=self.server_tz,
             )
-            data, tier = self._search_one_page(jql, page_size)
+            try:
+                data, tier = self._search_one_page(jql, page_size)
+            except JiraJqlError as exc:
+                # Auto-recover from "after_key references an issue JIRA no
+                # longer has." Without after_key the JQL drops the `key > X`
+                # tiebreaker — broader query, but valid. Idempotent upserts
+                # absorb any duplicates from the wider window.
+                if after_key and any(_STALE_KEY_RE.search(m) for m in exc.error_messages):
+                    logger.warning(
+                        "seek tiebreaker after_key=%s no longer exists in JIRA; "
+                        "clearing and retrying without it",
+                        after_key,
+                    )
+                    after_key = None
+                    continue
+                raise
             issues = data.get("issues") or []
             names = data.get("names") or {}
             schema = data.get("schema") or {}
@@ -412,7 +462,12 @@ class JiraClient:
         `start_at` is used by offset-paginated callers (`search_paged`); seek
         callers always pass `0` (default).
 
-        Raises `JiraFetchError` only if all three tiers fail.
+        Raises:
+          - `JiraJqlError` immediately on HTTP 400 — the QUERY is wrong (e.g.
+            tiebreaker key no longer exists in JIRA), so falling through to
+            hub/minimal tiers (which use the same JQL) can't help. Caller
+            decides whether to clear cursor state and retry.
+          - `JiraFetchError` only if all three tiers fail with non-400 errors.
         """
         url = f"{self.base_url}/rest/api/2/search"
         fast_fail = {"timeout": 60, "max_attempts": 2}
@@ -422,6 +477,10 @@ class JiraClient:
             data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
             return data, "full"
         except requests.RequestException as exc_full:
+            # 400 means JIRA rejected the JQL itself; hub/minimal use the same
+            # JQL and will fail identically. Fast-fail with structured detail.
+            if _is_http_400(exc_full):
+                raise _jql_error_from(exc_full, jql) from exc_full
             logger.warning("search tier=full failed (%s); retrying without issuelinks", exc_full)
             try:
                 body = base | {
