@@ -27,11 +27,25 @@ _LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for man
 _SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
 _SEARCH_PAGED_PAGE_SIZE = 50  # fields=*all without seek — older offset-paginated path
 
-# Matches JIRA's specific error when JQL `key > "X"` references a non-existent
-# issue. Seen in prod when an admin deletes an issue that happened to be a
-# previous cycle's seek-tiebreaker — every subsequent cycle then 400s forever
-# until the cursor key is cleared. We catch and auto-recover.
-_STALE_KEY_RE = re.compile(r"key '([^']+)' does not exist for field 'key'")
+# JIRA Server returns three distinct 400-error patterns when JQL `key > "X"`
+# references a key the server can't compare against. ALL of them wedge a seek
+# loop the same way (every subsequent cycle 400s forever until the cursor key
+# is cleared), so all three trigger the same auto-recovery: drop after_key,
+# retry. Patterns observed in prod 2026-05-20 (PROJ-1 deleted, PROJ-1234
+# reprojected) plus the malformed-key variant added defensively.
+_STALE_KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Issue was deleted (or never existed).
+    re.compile(r"An issue with key '([^']+)' does not exist for field 'key'"),
+    # Issue was moved/reprojected to another project.
+    re.compile(r"Operator '[^']+' cannot be applied to moved issue key '([^']+)'"),
+    # Cursor data corrupted: not a valid issue-key shape (no dash, etc.).
+    re.compile(r"The issue key '([^']*)' for field 'key' is invalid"),
+)
+
+
+def _is_stale_after_key_error(error_messages: list[str]) -> bool:
+    """True iff any JIRA error message matches a known stale-after_key pattern."""
+    return any(p.search(m) for m in error_messages for p in _STALE_KEY_PATTERNS)
 
 
 def _is_http_400(exc: BaseException) -> bool:
@@ -386,15 +400,17 @@ class JiraClient:
             try:
                 data, tier = self._search_one_page(jql, page_size)
             except JiraJqlError as exc:
-                # Auto-recover from "after_key references an issue JIRA no
-                # longer has." Without after_key the JQL drops the `key > X`
-                # tiebreaker — broader query, but valid. Idempotent upserts
-                # absorb any duplicates from the wider window.
-                if after_key and any(_STALE_KEY_RE.search(m) for m in exc.error_messages):
+                # Auto-recover from any "after_key references a key JIRA can't
+                # compare against" error (deleted, moved, or malformed key).
+                # Without after_key the JQL drops the `key > X` tiebreaker —
+                # broader query, but valid. Idempotent upserts on the caller
+                # side absorb any duplicates from the wider window.
+                if after_key and _is_stale_after_key_error(exc.error_messages):
                     logger.warning(
-                        "seek tiebreaker after_key=%s no longer exists in JIRA; "
+                        "seek tiebreaker after_key=%s rejected by JIRA (%s); "
                         "clearing and retrying without it",
                         after_key,
+                        exc.error_messages[0] if exc.error_messages else "?",
                     )
                     after_key = None
                     continue
