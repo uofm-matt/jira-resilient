@@ -606,6 +606,81 @@ def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch
 
 
 @responses.activate
+def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch):
+    """Variant: JIRA returns 'Operator '>' cannot be applied to moved issue
+    key 'X'' when after_key references a reprojected issue. Hit live on
+    a project (PROJ-1234 was moved between cycles). Same recovery as the
+    deleted-key variant — clear after_key, retry."""
+    import time
+    from datetime import UTC
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    client._server_tz = UTC
+
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"errorMessages": ["Operator '>' cannot be applied to moved issue key 'MOVED-42'."]},
+        status=400,
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "OK-1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+
+    pages = list(client.search_seek("PROJ", after_key="MOVED-42"))
+    assert len(pages) == 1
+    assert pages[0].issues[0]["key"] == "OK-1"
+
+
+@responses.activate
+def test_search_seek_recovers_from_invalid_key_format(client, base_url, monkeypatch):
+    """Variant: JIRA returns 'The issue key 'X' for field 'key' is invalid'
+    when after_key is malformed (no dash, etc.). Defensive — shouldn't
+    happen naturally from seek pagination, but if cursor data ever gets
+    corrupted, recover instead of looping forever."""
+    import time
+    from datetime import UTC
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    client._server_tz = UTC
+
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"errorMessages": ["The issue key 'BROKEN' for field 'key' is invalid."]},
+        status=400,
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "OK-1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+
+    pages = list(client.search_seek("PROJ", after_key="BROKEN"))
+    assert len(pages) == 1
+
+
+@responses.activate
 def test_search_seek_propagates_400_when_after_key_is_none(client, base_url, monkeypatch):
     """If the stale-key error fires when there's no after_key to clear, the
     auto-recovery has nothing to do — propagate the error rather than looping.

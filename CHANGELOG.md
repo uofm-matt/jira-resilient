@@ -2,6 +2,28 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] — 2026-05-20
+
+### Fixed
+- **`search_seek` auto-recovers from two more `after_key` failure modes**
+  in addition to the deleted-issue case shipped in 0.2.1:
+  - `"Operator '>' cannot be applied to moved issue key 'X'."` — fires
+    when the cursor's after_key was reprojected to another project.
+    Hit live on a project (PROJ-1234) one hour after the 0.2.1 deploy.
+  - `"The issue key 'X' for field 'key' is invalid."` — defensive: fires
+    if cursor data is somehow malformed (no dash, wrong shape). Doesn't
+    happen organically from the seek loop but recovers if it ever does.
+
+  All three patterns now in `_STALE_KEY_PATTERNS`. Same recovery as before
+  (clear after_key, retry); same idempotent-upsert assumption.
+
+### Discovered
+- Probed JIRA Server's full 400-error surface for cursor edge-cases. Six
+  patterns total — three trigger the after_key auto-recovery above; the
+  other three (deleted project, schema field gone, invalid date format)
+  are different bug classes that aren't recoverable in this layer and
+  propagate as `JiraJqlError` for caller diagnosis.
+
 ## [0.2.1] — 2026-05-20
 
 ### Fixed
