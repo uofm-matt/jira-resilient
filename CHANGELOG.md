@@ -2,6 +2,36 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-05-20
+
+### Fixed
+- **`search_seek` auto-recovers from stale tiebreaker keys.** If a previous
+  cycle's `after_key` references a JIRA issue that has since been deleted
+  (or reprojected, or otherwise no longer exists), JIRA returns HTTP 400
+  `"An issue with key 'X' does not exist for field 'key'."` for *every*
+  subsequent call. The seek loop now detects this, clears `after_key`,
+  and retries the same window without the tiebreaker. Idempotent upserts
+  on the caller side absorb the slight widening.
+
+  Production trigger: a JIRA admin deletion of a project's most-recent
+  issue silently broke that project's delta sync, with every cycle
+  failing identically until an operator manually NULL'd `after_key`
+  in the cursor store. Now the loop self-heals on the next cycle.
+
+### Changed
+- **`_search_one_page` fast-fails on HTTP 400** instead of falling through
+  to hub/minimal tiers. Tier 2 and 3 use the same JQL, so they will fail
+  identically — 3 round trips when 1 would suffice. The new behavior is:
+  - 400 → `JiraJqlError` immediately (with JIRA's `errorMessages` for
+    caller introspection)
+  - timeout / 5xx / other → tier ladder as before
+
+### Added
+- **`JiraJqlError`** — new exception type for "JIRA rejected the query."
+  Carries `error_messages: list[str]` from JIRA's response body verbatim,
+  so callers can pattern-match (e.g. `search_seek` matches the stale-key
+  message to decide whether to auto-recover). Subclass of `JiraResilientError`.
+
 ## [0.2.0] — 2026-05-19
 
 **Breaking change.** Inverted the default for single-issue fetches: the safe
