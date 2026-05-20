@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta, tzinfo
 
 import requests
 
-from jira_resilient._models import ResilientFetchResult, SearchPage
+from jira_resilient._models import ResilientFetchResult, SearchPage, Tier
 from jira_resilient.exceptions import JiraFetchError, JiraParseError
 from jira_resilient.http import make_session, request_with_retry
 from jira_resilient.jql import build_seek_jql
@@ -33,6 +33,9 @@ _MINIMAL_FIELDS = (
     "summary,status,issuetype,priority,assignee,reporter,creator,"
     "labels,fixVersions,components,created,updated,resolutiondate,duedate,resolution"
 )
+
+# Same field set, but as a list for the POST-body form used by /search.
+_MINIMAL_FIELDS_LIST = _MINIMAL_FIELDS.split(",")
 
 
 class JiraClient:
@@ -323,7 +326,6 @@ class JiraClient:
 
         Raises `JiraParseError` if a returned issue is missing `fields.updated` or `key`.
         """
-        url = f"{self.base_url}/rest/api/2/search"
         # Last-N boundaries — detects longer cycles than the prev_boundary check.
         # 3-key cycles within a single minute were observed in production on busy
         # projects where JQL `updated > "X:Y"` (minute precision) re-matches every
@@ -338,22 +340,7 @@ class JiraClient:
                 extra_filter=extra_filter,
                 tz=self.server_tz,
             )
-            body = {
-                "jql": jql,
-                "startAt": 0,
-                "maxResults": page_size,
-                "fields": ["*all"],
-                "expand": ["changelog", "names", "schema"],
-            }
-            data = request_with_retry(
-                self.session,
-                "POST",
-                url,
-                json=body,
-                timeout=self.timeout,
-                max_attempts=self.max_attempts,
-            ).json()
-            issues = data.get("issues") or []
+            issues, names, schema, tier = self._search_one_page(jql, page_size)
             if not issues:
                 break
 
@@ -384,8 +371,95 @@ class JiraClient:
                 recent_boundaries.clear()
                 continue
 
-            yield SearchPage(issues, data.get("names") or {}, data.get("schema") or {})
+            yield SearchPage(issues, names, schema, tier=tier)
             recent_boundaries.append(current_boundary)
             # Monotonic floor — see the docstring for why.
             after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
             after_key = last_key
+
+    def _search_one_page(self, jql: str, page_size: int) -> tuple[list[dict], dict, dict, Tier]:
+        """Three-tier `/search` request mirroring `get_issue_resilient`'s shape.
+
+        Tier 1 (full):    `fields=["*all"]` + `expand=changelog,names,schema`.
+        Tier 2 (hub):     `fields=["*all","-issuelinks"]` + `expand=names,schema`;
+                          for each returned issue, fetch `issuelinks` separately
+                          via `get_issuelinks(key)` and graft them back into
+                          `fields.issuelinks`. Loses the changelog expansion at
+                          this tier — callers needing per-issue history under
+                          hub conditions should call `get_changelog(key)` on
+                          the affected keys.
+        Tier 3 (minimal): a small fixed field set (`_MINIMAL_FIELDS_LIST`); no
+                          changelog, no issuelinks, no custom fields. Keeps the
+                          delta cursor advancing even when one page contains a
+                          truly pathological issue.
+
+        Returns `(issues, names, schema, tier_used)` so the seek loop above can
+        yield `SearchPage(..., tier=tier_used)` and operators can observe the
+        degradation in logs.
+
+        Raises `JiraFetchError` only if all three tiers fail.
+        """
+        url = f"{self.base_url}/rest/api/2/search"
+        fast_fail = {"timeout": 60, "max_attempts": 2}
+        base = {"jql": jql, "startAt": 0, "maxResults": page_size}
+        try:
+            body = base | {"fields": ["*all"], "expand": ["changelog", "names", "schema"]}
+            data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
+            return (
+                data.get("issues") or [],
+                data.get("names") or {},
+                data.get("schema") or {},
+                "full",
+            )
+        except requests.RequestException as exc_full:
+            logger.warning("search tier=full failed (%s); retrying without issuelinks", exc_full)
+            try:
+                body = base | {
+                    "fields": ["*all", "-issuelinks"],
+                    "expand": ["names", "schema"],
+                }
+                data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
+                issues = data.get("issues") or []
+                for issue in issues:
+                    key = issue.get("key")
+                    if not key:
+                        continue
+                    try:
+                        issue.setdefault("fields", {})["issuelinks"] = self.get_issuelinks(key)
+                    except requests.RequestException as exc_links:
+                        logger.warning(
+                            "issuelinks fetch failed for %s in hub tier (%s); "
+                            "leaving issuelinks empty for this issue",
+                            key,
+                            exc_links,
+                        )
+                        issue.setdefault("fields", {})["issuelinks"] = []
+                return (
+                    issues,
+                    data.get("names") or {},
+                    data.get("schema") or {},
+                    "hub",
+                )
+            except requests.RequestException as exc_hub:
+                logger.warning(
+                    "search tier=hub failed (%s); falling back to minimal fields", exc_hub
+                )
+                try:
+                    body = base | {
+                        "fields": _MINIMAL_FIELDS_LIST,
+                        "expand": ["names", "schema"],
+                    }
+                    data = request_with_retry(
+                        self.session, "POST", url, json=body, **fast_fail
+                    ).json()
+                    return (
+                        data.get("issues") or [],
+                        data.get("names") or {},
+                        data.get("schema") or {},
+                        "minimal",
+                    )
+                except requests.RequestException as exc_min:
+                    raise JiraFetchError(
+                        f"all three search tiers failed for jql={jql!r}: "
+                        f"full={exc_full!r}; hub={exc_hub!r}; minimal={exc_min!r}"
+                    ) from exc_min

@@ -217,3 +217,197 @@ def test_get_issue_resilient_all_fail(client, base_url, monkeypatch):
         )
     with pytest.raises(JiraFetchError, match="all three fetch tiers failed"):
         client.get_issue_resilient("XX-1")
+
+
+# ----- resilient search tiers ---------------------------------------------
+#
+# Mirror the get_issue_resilient pattern at the listing layer. When a hub
+# issue with thousands of issuelinks lands in a /search page, the response
+# payload can blow the 120s timeout. The seek paginator falls back through
+# the same three tiers (full -> hub -> minimal) as the per-key fetch.
+
+
+@responses.activate
+def test_search_seek_default_tier_is_full(client, base_url):
+    """Happy path: full tier succeeds, SearchPage.tier == 'full'."""
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+    pages = list(client.search_seek("XX"))
+    assert len(pages) == 1
+    assert pages[0].tier == "full"
+
+
+@responses.activate
+def test_search_seek_falls_back_to_hub(client, base_url, monkeypatch):
+    """Full search times out → hub tier succeeds → issuelinks fetched per-issue.
+
+    The hub-tier issuelinks supplement is what makes the difference operationally:
+    a 5,000-link hub no longer poisons every page that happens to contain it.
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    # Tier 1 (full): 2 attempts, both timeout.
+    for _ in range(2):
+        responses.add(
+            responses.POST,
+            f"{base_url}/rest/api/2/search",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+    # Tier 2 (hub): one POST succeeds with an issue lacking `issuelinks`.
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    # Per-issue issuelinks fetch supplements the hub-tier response.
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1",
+        json={"fields": {"issuelinks": [{"id": "9999"}]}},
+    )
+    # Second page (empty) — at the "full" tier, since the seek loop restarts at tier 1.
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+
+    pages = list(client.search_seek("XX"))
+    assert len(pages) == 1
+    assert pages[0].tier == "hub"
+    assert pages[0].issues[0]["fields"]["issuelinks"] == [{"id": "9999"}]
+
+
+@responses.activate
+def test_search_seek_falls_back_to_minimal(client, base_url, monkeypatch):
+    """Full + hub both time out → minimal tier succeeds.
+
+    Minimal tier loses changelog + custom fields + issuelinks but keeps the seek
+    cursor moving. Strictly preferable to a dark delta when the alternative is
+    no progress at all.
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    # 2 timeouts (full) + 2 timeouts (hub) = 4 timeouts before minimal gets called.
+    for _ in range(4):
+        responses.add(
+            responses.POST,
+            f"{base_url}/rest/api/2/search",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+
+    pages = list(client.search_seek("XX"))
+    assert len(pages) == 1
+    assert pages[0].tier == "minimal"
+
+
+@responses.activate
+def test_search_seek_all_tiers_fail_raises(client, base_url, monkeypatch):
+    """When even the minimal tier times out, surface a JiraFetchError that names
+    all three underlying exceptions — operators need to see the full chain to
+    distinguish 'JIRA is completely down' from 'one project has a 10k-link hub'.
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    # 2 + 2 + 2 = 6 timeouts cover every retry across all three search tiers.
+    for _ in range(6):
+        responses.add(
+            responses.POST,
+            f"{base_url}/rest/api/2/search",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+
+    with pytest.raises(JiraFetchError, match="all three search tiers failed"):
+        list(client.search_seek("XX"))
+
+
+@responses.activate
+def test_search_seek_hub_tier_tolerates_issuelinks_failure(client, base_url, monkeypatch):
+    """If the per-issue issuelinks fetch fails for ONE issue, hub tier still
+    progresses with `issuelinks=[]` for that issue — better partial data than
+    the whole page failing because one hub couldn't serialize its own links.
+    """
+    import time
+
+    import requests
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    # Full tier fails.
+    for _ in range(2):
+        responses.add(
+            responses.POST,
+            f"{base_url}/rest/api/2/search",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+    # Hub tier returns one issue.
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    # issuelinks fetch fails for that one issue (all 2 attempts).
+    for _ in range(2):
+        responses.add(
+            responses.GET,
+            f"{base_url}/rest/api/2/issue/XX-1",
+            body=requests.exceptions.Timeout("simulated"),
+        )
+    # Next page empty (back at tier 1).
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+
+    pages = list(client.search_seek("XX"))
+    assert len(pages) == 1
+    assert pages[0].tier == "hub"
+    # The issuelinks fetch failed, so we get an empty list, not a missing key.
+    assert pages[0].issues[0]["fields"]["issuelinks"] == []
