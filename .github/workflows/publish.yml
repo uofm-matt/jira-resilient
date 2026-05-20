@@ -12,6 +12,7 @@ jobs:
     environment: pypi
     permissions:
       id-token: write    # required for trusted publishing
+      contents: write    # required for `gh release create`
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,3 +21,31 @@ jobs:
       - run: pip install build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+      # Extract the changelog entry for this tag and create a GitHub Release.
+      # awk pattern: print lines between `## [X.Y.Z]` header and the next
+      # `## [` header (exclusive), drop the trailing blank.  Falls back to
+      # an empty body if the section isn't found.
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="## [$VERSION]" '
+            $0 ~ ver {flag=1; next}
+            /^## \[/ {flag=0}
+            flag {print}
+          ' CHANGELOG.md > /tmp/release_notes.md
+          # If CHANGELOG didn't yield anything, fall back to a stub.
+          if [ ! -s /tmp/release_notes.md ]; then
+            echo "Release $GITHUB_REF_NAME — see CHANGELOG.md for details." > /tmp/release_notes.md
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release_notes.md \
+            --latest
