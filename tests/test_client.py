@@ -6,6 +6,7 @@ import pytest
 import responses
 
 from jira_resilient import JiraClient, JiraFetchError, JiraParseError
+from jira_resilient.exceptions import JiraJqlError
 
 
 @pytest.fixture
@@ -522,3 +523,105 @@ def test_search_paged_falls_back_to_hub(client, base_url, monkeypatch):
     assert len(pages) == 1
     assert pages[0].tier == "hub"
     assert pages[0].issues[0]["fields"]["issuelinks"] == [{"id": "9999"}]
+
+
+# ----- HTTP 400 (JQL error) handling — fast-fail + stale-key auto-recovery ---
+
+
+@responses.activate
+def test_search_400_raises_jql_error_immediately(client, base_url, monkeypatch):
+    """JIRA's 400 means the QUERY is bad — same JQL on hub/minimal will fail
+    identically. Don't waste round-trips; raise JiraJqlError with the
+    `errorMessages` array verbatim so callers can pattern-match.
+    """
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    body = {
+        "errorMessages": ["An issue with key 'STALE-99' does not exist for field 'key'."],
+        "errors": {},
+    }
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json=body,
+        status=400,
+    )
+
+    with pytest.raises(JiraJqlError) as ei:
+        client._search_one_page('project = "X" AND key > "STALE-99"', page_size=20)
+    assert "STALE-99" in ei.value.error_messages[0]
+    # Only ONE request issued — no hub/minimal fall-through.
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch):
+    """End-to-end: seek loop sees 400 'key X does not exist', clears its stale
+    tiebreaker, retries the same window without `key > X`, and continues. This
+    is the PROJ-style operator pain point — without auto-recovery the loop
+    would 400 forever once an admin deleted a previous cycle's last_seen_key.
+    """
+    import time
+    from datetime import UTC, datetime
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    client._server_tz = UTC  # skip the /serverInfo probe (not mocked here)
+
+    # First call (with after_key=STALE-99): 400 "key does not exist"
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"errorMessages": ["An issue with key 'STALE-99' does not exist for field 'key'."]},
+        status=400,
+    )
+    # Second call (after_key cleared): succeeds with one issue, then empty page terminates.
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={
+            "issues": [{"key": "OK-1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "names": {},
+            "schema": {},
+        },
+    )
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"issues": [], "names": {}, "schema": {}},
+    )
+
+    pages = list(
+        client.search_seek(
+            "PROJ",
+            after_ts=datetime.fromisoformat("2026-05-20T06:00:00+00:00"),
+            after_key="STALE-99",
+        )
+    )
+    # The loop recovered: one page yielded, three total POSTs (400, recovery success, empty).
+    assert len(pages) == 1
+    assert pages[0].issues[0]["key"] == "OK-1"
+    assert len(responses.calls) == 3
+
+
+@responses.activate
+def test_search_seek_propagates_400_when_after_key_is_none(client, base_url, monkeypatch):
+    """If the stale-key error fires when there's no after_key to clear, the
+    auto-recovery has nothing to do — propagate the error rather than looping.
+    Otherwise a JQL bug elsewhere (e.g. malformed extra_filter) would silently
+    hang the loop forever."""
+    import time
+    from datetime import UTC
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    client._server_tz = UTC
+
+    responses.add(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        json={"errorMessages": ["JQL parse error: malformed clause"]},
+        status=400,
+    )
+    with pytest.raises(JiraJqlError):
+        list(client.search_seek("PROJ"))  # no after_key set
