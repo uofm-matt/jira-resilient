@@ -2,6 +2,38 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.3] — 2026-05-19
+
+### Added
+- **Resilient search tier for `search_seek`.** Mirrors `get_issue_resilient`'s
+  three-tier pattern at the listing layer: when a `/search` page POST times
+  out (typically because one issue in the page is a hub with thousands of
+  `issuelinks` ballooning the payload), the seek paginator now falls back to:
+  - Tier 2 (hub): `fields=["*all","-issuelinks"]` on the search, then
+    supplements `issuelinks` per-issue via `get_issuelinks(key)`. Loses the
+    changelog expansion at this tier.
+  - Tier 3 (minimal): a small fixed field set (no changelog, no issuelinks,
+    no custom fields). Keeps the seek cursor advancing even when one page
+    contains a truly pathological issue.
+- `SearchPage` grew a `tier: Tier` field (default `"full"`) so callers can
+  log the tier each page hit and observe degradation. Backwards-compatible
+  — the existing positional `(issues, names, schema)` destructuring still works.
+
+### Fixed
+- **PROJ-class hub timeouts no longer block delta sync.** Before 0.1.3, a
+  single hub issue with 5000+ `issuelinks` falling into the delta window
+  would 120s-timeout every `/search` page that contained it — and on busy
+  projects that's every page until the hub's `updated` rolled past. The
+  loader would fail the whole project and (if chained behind another loader
+  in systemd) block downstream loaders entirely. The resilient tier above
+  fixes this in jira-resilient itself.
+
+### Raises
+- `JiraFetchError("all three search tiers failed for jql=...")` if even the
+  minimal tier times out. Operators should treat this as JIRA-down, not a
+  per-project hub issue. Existing `JiraParseError` for malformed-row pages
+  is unchanged.
+
 ## [0.1.2] — 2026-05-19
 
 ### Fixed
