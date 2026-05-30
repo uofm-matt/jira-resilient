@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jira-resilient"
-version = "0.2.12"
+version = "0.3.0a0"
 description = "Resilient JIRA Server data extraction at scale — seek pagination, reindex-aware recovery, three-tier resilient issue fetch."
 readme = "README.md"
 license = { text = "MIT" }
