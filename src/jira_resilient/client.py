@@ -245,6 +245,75 @@ class JiraClient:
                 break
         return histories
 
+    def get_worklogs(self, key: str, *, page_size: int = 100) -> list[dict]:
+        """Full worklog list via paginated `/rest/api/2/issue/{key}/worklog`.
+
+        JIRA search responses include at most 20 worklogs inline. This method
+        fetches the complete history for issues where the inline response was
+        truncated (`fields.worklog.total > len(fields.worklog.worklogs)`).
+        """
+        url = f"{self.base_url}/rest/api/2/issue/{key}/worklog"
+        worklogs: list[dict] = []
+        start_at = 0
+        while True:
+            data = request_with_retry(
+                self.session,
+                "GET",
+                url,
+                params={"startAt": start_at, "maxResults": page_size},
+                timeout=60,
+                max_attempts=3,
+            ).json()
+            page = data.get("worklogs") or []
+            worklogs.extend(page)
+            start_at += len(page)
+            if not page or start_at >= data.get("total", 0):
+                break
+        return worklogs
+
+    def get_comments(self, key: str, *, page_size: int = 50) -> list[dict]:
+        """Full comment list via paginated `/rest/api/2/issue/{key}/comment`.
+
+        JIRA search responses cap inline comments (the exact limit is
+        configurable per-instance via `jira.search.max.comments`, defaulting
+        to 10 on older JIRA Server versions). Use when
+        `fields.comment.total > len(fields.comment.comments)`.
+        """
+        url = f"{self.base_url}/rest/api/2/issue/{key}/comment"
+        comments: list[dict] = []
+        start_at = 0
+        while True:
+            data = request_with_retry(
+                self.session,
+                "GET",
+                url,
+                params={"startAt": start_at, "maxResults": page_size},
+                timeout=60,
+                max_attempts=3,
+            ).json()
+            page = data.get("comments") or []
+            comments.extend(page)
+            start_at += len(page)
+            if not page or start_at >= data.get("total", 0):
+                break
+        return comments
+
+    def get_remote_links(self, key: str) -> list[dict]:
+        """All remote links for an issue via `/rest/api/2/issue/{key}/remotelink`.
+
+        Remote links (Confluence pages, GitHub PRs, external URLs) are not
+        included in search responses — they require this dedicated endpoint.
+        JIRA returns all remote links in a single non-paginated response.
+        """
+        url = f"{self.base_url}/rest/api/2/issue/{key}/remotelink"
+        return request_with_retry(
+            self.session,
+            "GET",
+            url,
+            timeout=30,
+            max_attempts=3,
+        ).json() or []
+
     def get_issue_resilient(self, key: str) -> ResilientFetchResult:
         """Three-tier resilient fetch.
 
@@ -389,14 +458,55 @@ class JiraClient:
         # issue in the X:Y minute regardless of after_key. A simple prev-vs-current
         # check misses these; a deque catches cycles of length up to maxlen-1.
         recent_boundaries: deque[tuple[datetime, str]] = deque(maxlen=10)
+        # Post-reindex stale detection — two complementary mechanisms:
+        #
+        # 1. stale_cycles: the loop manifests as a repeating page boundary (cluster
+        #    fits within deque maxlen-1 pages, so the bump path keeps firing). When a
+        #    boundary repeats and new_ts < bumped after_ts, the minute advance isn't
+        #    escaping — Lucene timestamps diverged from fields.updated. After
+        #    _STALE_CYCLE_LIMIT consecutive stale bumps → id-ordered fallback.
+        #
+        # 2. duplicate-key detection: the loop manifests as yielded pages (boundary
+        #    never repeats within the deque window). Once a full reindex cycle's keys
+        #    are in `seen_keys`, every further page is 100% duplicates. Tracking the
+        #    seen set is exact and data-independent — unlike a numeric key cursor,
+        #    which is unsound because JIRA orders keys lexically (the numeric suffix
+        #    is non-monotonic across digit boundaries: -1, -10, -11, …, -2, -20).
+        #    `seen_keys` is bounded by the project's issue count and freed when the
+        #    generator completes.
+        _STALE_CYCLE_LIMIT = 3
+        _STALE_DUP_LIMIT = 3
+        stale_cycles = 0
+        consecutive_dup_pages = 0
+        seen_keys: set[str] = set()
+        using_key_fallback = False
+        after_id: int | None = None  # cursor for the id-ordered fallback scan
         while True:
-            jql = build_seek_jql(
-                project_key,
-                after_ts=after_ts,
-                after_key=after_key,
-                extra_filter=extra_filter,
-                tz=self.server_tz,
-            )
+            if using_key_fallback:
+                # Post-reindex fallback: abandon the time cursor and scan by issue
+                # id ascending. A key cursor cannot work here — JIRA evaluates
+                # `key > "X"` numerically (by issue number) but `ORDER BY key ASC`
+                # lexically, and the two disagree across digit boundaries
+                # (PROJ-1, PROJ-10, PROJ-100, PROJ-1000, …). With a lexical sort
+                # the page's last key has a small number, so the numeric `key >`
+                # filter re-returns the same page forever. `id` has one consistent
+                # numeric ordering for both the filter and the sort, so this scan
+                # advances monotonically and terminates at id exhaustion. Idempotent
+                # upserts downstream absorb duplicates with the earlier time pages.
+                jql = f'project = "{project_key}"'
+                if after_id is not None:
+                    jql += f" AND id > {after_id}"
+                if extra_filter:
+                    jql += f" AND {extra_filter}"
+                jql += " ORDER BY id ASC"
+            else:
+                jql = build_seek_jql(
+                    project_key,
+                    after_ts=after_ts,
+                    after_key=after_key,
+                    extra_filter=extra_filter,
+                    tz=self.server_tz,
+                )
             try:
                 data, tier = self._search_one_page(jql, page_size)
             except JiraJqlError as exc:
@@ -437,22 +547,87 @@ class JiraClient:
             if new_ts is None or last_key is None:
                 raise JiraParseError(f"Page ended with row missing updated/key: {last!r}")
 
+            if using_key_fallback:
+                yield SearchPage(issues, names, schema, tier=tier, fallback=True)
+                # Issues are sorted by id ASC, so the last row holds the page's max
+                # id — JIRA always returns `id` on search results.
+                after_id = int(issues[-1]["id"])
+                continue
+
             current_boundary = (new_ts, last_key)
             if current_boundary in recent_boundaries and after_ts is not None:
                 # Cycle detected (1-cycle = boundary repeat, N-cycle = same boundary seen
                 # within the last `maxlen` pages). Bump the minute past the current after_ts
                 # and clear after_key — the next iteration starts a fresh window at the new
                 # minute, no tiebreaker needed.
-                after_ts = (after_ts + timedelta(minutes=1)).replace(second=0, microsecond=0)
+                bumped = (after_ts + timedelta(minutes=1)).replace(second=0, microsecond=0)
+                # Post-reindex stale-cycle detection: if fields.updated (new_ts) is still
+                # behind the bumped after_ts, the minute-advance isn't working — JIRA's
+                # Lucene index has diverged from fields.updated (post-reindex, all issues
+                # are re-indexed at the reindex time but fields.updated shows original
+                # timestamps). Count consecutive stale bumps; after the limit, switch to
+                # id-ordered pagination which terminates by id exhaustion regardless of
+                # JIRA's indexed timestamps.
+                if new_ts < bumped:
+                    stale_cycles += 1
+                else:
+                    stale_cycles = 0
+                if stale_cycles >= _STALE_CYCLE_LIMIT:
+                    logger.warning(
+                        "seek project=%s: %d consecutive stale minute-bumps "
+                        "(fields.updated=%s < after_ts=%s) — Lucene/field mismatch "
+                        "detected; switching to id-ordered fallback pagination",
+                        project_key,
+                        stale_cycles,
+                        new_ts,
+                        after_ts,
+                    )
+                    using_key_fallback = True
+                    recent_boundaries.clear()
+                    continue
+                after_ts = bumped
                 after_key = None
                 recent_boundaries.clear()
                 continue
 
             yield SearchPage(issues, names, schema, tier=tier)
             recent_boundaries.append(current_boundary)
-            # Monotonic floor — see the docstring for why.
-            after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
-            after_key = last_key
+            # Monotonic floor — normally advances after_ts to max(prev, new).
+            # Guard: when a full page returns with fields.updated far ahead of the
+            # current JQL minute, Lucene position ≠ fields.updated (bulk transition
+            # followed by later edits). Hold after_ts stable to exhaust the current
+            # minute cluster by key before advancing, preventing cursor jumps that
+            # abandon remaining cluster issues.
+            if (
+                after_ts is not None
+                and len(issues) == page_size
+                and new_ts > after_ts + timedelta(minutes=2)
+            ):
+                after_key = last_key  # stay in current minute, advance key only
+            else:
+                after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
+                after_key = last_key
+            # Duplicate-key detection (mechanism 2 — yielded-page loop).
+            # A healthy page always contributes at least one key we haven't seen.
+            # A post-reindex loop re-yields a cycle of already-seen keys; once the
+            # set is saturated, every page is all-duplicates. _STALE_DUP_LIMIT
+            # consecutive zero-new-key pages → id-ordered fallback.
+            if any(k not in seen_keys for issue in issues if (k := issue.get("key"))):
+                consecutive_dup_pages = 0
+            else:
+                consecutive_dup_pages += 1
+                if consecutive_dup_pages >= _STALE_DUP_LIMIT:
+                    logger.warning(
+                        "seek project=%s: %d consecutive all-duplicate pages "
+                        "(last_key=%s) — Lucene/field mismatch detected; "
+                        "switching to id-ordered fallback pagination",
+                        project_key,
+                        consecutive_dup_pages,
+                        last_key,
+                    )
+                    using_key_fallback = True
+                    seen_keys.clear()
+            seen_keys.update(k for issue in issues if (k := issue.get("key")))
 
     def _search_one_page(self, jql: str, page_size: int, *, start_at: int = 0) -> tuple[dict, Tier]:
         """Three-tier `/search` request mirroring `get_issue_resilient`'s shape.
