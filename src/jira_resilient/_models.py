@@ -20,12 +20,19 @@ class SearchPage(NamedTuple):
     when a single hub issue's `issuelinks` blew the page payload, and "minimal"
     when even that wasn't enough. Callers usually log the tier so operators see
     which projects are tipping toward pathological.
+
+    `fallback` is True when the page came from `search_seek`'s post-reindex
+    id-ordered recovery scan rather than the normal time cursor. Incremental
+    callers (delta sync) use this to stop early once the recovery scan stops
+    surfacing changes — the time cursor is unreliable post-reindex, so the
+    fallback re-scans the whole project, which is wasteful for a delta.
     """
 
     issues: list[dict]
     names: dict[str, str]
     schema: dict[str, dict]
     tier: Tier = "full"
+    fallback: bool = False
 
 
 class ResilientFetchResult(NamedTuple):

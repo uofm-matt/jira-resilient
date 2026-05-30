@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 import responses
 
@@ -36,7 +38,7 @@ def test_get_issue(client, base_url):
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/issue/XX-1",
-        json={"key": "XX-1", "fields": {"summary": "Test"}},
+        json={"key": "XX-1", "id": "1", "fields": {"summary": "Test"}},
         status=200,
     )
     issue = client.get_issue("XX-1")
@@ -88,7 +90,7 @@ def test_get_issuelinks_returns_field_value(client, base_url):
 @responses.activate
 def test_search_seek_yields_pages(client, base_url):
     p1 = {
-        "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+        "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
         "names": {},
         "schema": {},
     }
@@ -109,15 +111,15 @@ def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
     ts = "2026-05-19T11:51:07.000-0400"
     cycle_page = {
         "issues": [
-            {"key": "XX-208847", "fields": {"updated": ts}},
-            {"key": "XX-209026", "fields": {"updated": ts}},
-            {"key": "XX-209073", "fields": {"updated": ts}},
+            {"key": "XX-208847", "id": "208847", "fields": {"updated": ts}},
+            {"key": "XX-209026", "id": "209026", "fields": {"updated": ts}},
+            {"key": "XX-209073", "id": "209073", "fields": {"updated": ts}},
         ],
         "names": {},
         "schema": {},
     }
     after_page = {
-        "issues": [{"key": "XX-300", "fields": {"updated": "2026-05-19T11:53:00.000-0400"}}],
+        "issues": [{"key": "XX-300", "id": "300", "fields": {"updated": "2026-05-19T11:53:00.000-0400"}}],
         "names": {},
         "schema": {},
     }
@@ -145,11 +147,103 @@ def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
 
 
 @responses.activate
+def test_search_seek_post_reindex_falls_back_to_key_only(client, base_url):
+    """Regression: after a JIRA server-side reindex, all project issues are re-indexed
+    at the reindex timestamp but fields.updated still shows original (older) values.
+    The seek JQL `updated >= "X"` matches everything regardless of X, so minute-bumping
+    never advances new_ts past after_ts — stale cycle detection fires after 3 consecutive
+    stale minute-advances and switches to key-only pagination, which terminates by
+    exhausting all keys.
+    """
+    from datetime import datetime
+
+    # after_ts is in 2026; all cluster issues have original updated_at from 2024
+    after_ts = datetime(2026, 5, 19, 11, 51, tzinfo=UTC)
+    ts_old = "2024-07-14T19:37:16.000+0000"  # original, always behind after_ts
+
+    # JIRA returns the same 2-issue page regardless of updated >= "X" filter
+    # (Lucene sees them as recently indexed; fields.updated is unchanged/old).
+    stale_page = {
+        "issues": [
+            {"key": "OPS-1", "id": "1", "fields": {"updated": ts_old}},
+            {"key": "OPS-2", "id": "2", "fields": {"updated": ts_old}},
+        ],
+        "names": {},
+        "schema": {},
+    }
+    # After switching to key-only, JIRA returns a later page by key
+    key_only_page = {
+        "issues": [{"key": "OPS-99", "id": "99", "fields": {"updated": ts_old}}],
+        "names": {},
+        "schema": {},
+    }
+    empty_page = {"issues": [], "names": {}, "schema": {}}
+
+    # Stale-cycle pattern: each cycle is 2 pages (page N, then repeat detected on page N+1).
+    # 3 cycles x 2 pages = 6 stale pages before the key-only switch fires.
+    # Add a few extra to simulate the pre-switch pages being yielded each cycle.
+    for _ in range(20):
+        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=stale_page)
+    # Key-only response (the fallback scan)
+    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=key_only_page)
+    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=empty_page)
+
+    pages = list(client.search_seek("OPS", after_ts=after_ts, page_size=2))
+
+    # Should terminate in a bounded number of pages, not consume all 20 stale mocks.
+    all_keys = [i["key"] for p in pages for i in p.issues]
+    assert "OPS-99" in all_keys, "should reach the key-only fallback page with OPS-99"
+    # Stale pages are yielded during the detection window; key-only page is also included.
+    assert len(pages) < 20, f"should terminate well before 20 pages, got {len(pages)}"
+
+
+@responses.activate
+def test_search_seek_post_reindex_long_cycle_falls_back_to_key_only(client, base_url):
+    """Long-cycle Lucene-reindex regression: cycle length (12 pages) exceeds the
+    deque window (maxlen=10) so stale_cycles never fires and every page is yielded.
+    Instead, duplicate-key detection notices that the restarted cycle re-yields
+    already-seen keys and triggers key-only fallback after 3 consecutive
+    all-duplicate pages. This path is immune to JIRA's lexical key ordering, which
+    makes a numeric key cursor unsound (suffixes are non-monotonic: -1, -10, -2…).
+    """
+
+    def make_page(key: str, hour: int) -> dict:
+        ts = f"2024-01-01T{hour:02d}:00:00.000+0000"
+        issue = {"key": key, "id": key.rsplit("-", 1)[-1], "fields": {"updated": ts}}
+        return {"issues": [issue], "names": {}, "schema": {}}
+
+    # 12 issues, each with a distinct timestamp spaced hours apart.
+    # Cycle length = 12 pages (page_size=1) — exceeds deque maxlen=10 so the
+    # (ts, key) boundary for page 1 is evicted before cycle 2 starts.
+    cycle_pages = [make_page(f"OPS-{i}", i) for i in range(1, 13)]
+
+    key_only_page = make_page("OPS-99", 1)
+    empty_page = {"issues": [], "names": {}, "schema": {}}
+
+    # Cycle 1: 12 pages — populates seen_keys with OPS-1..OPS-12
+    for p in cycle_pages:
+        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=p)
+    # Cycle 2: 3 all-duplicate pages (OPS-1, OPS-2, OPS-3) — triggers fallback on page 3
+    for p in cycle_pages[:3]:
+        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=p)
+    # Key-only scan terminates normally
+    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=key_only_page)
+    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=empty_page)
+
+    pages = list(client.search_seek("OPS", page_size=1))
+
+    all_keys = [i["key"] for p in pages for i in p.issues]
+    assert "OPS-99" in all_keys, "should reach key-only fallback page with OPS-99"
+    # Cycle 1 (12) + 3 regression pages (all yielded before fallback triggers) + 1 key-only = 16
+    assert len(pages) == 16, f"expected 16 pages, got {len(pages)}"
+
+
+@responses.activate
 def test_search_seek_raises_parse_error_on_missing_updated(client, base_url):
     responses.add(
         responses.POST,
         f"{base_url}/rest/api/2/search",
-        json={"issues": [{"key": "XX-1", "fields": {}}]},
+        json={"issues": [{"key": "XX-1", "id": "1", "fields": {}}]},
     )
     with pytest.raises(JiraParseError):
         list(client.search_seek("XX"))
@@ -160,7 +254,7 @@ def test_get_issue_resilient_full_succeeds(client, base_url):
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/issue/XX-1",
-        json={"key": "XX-1", "fields": {"summary": "test"}},
+        json={"key": "XX-1", "id": "1", "fields": {"summary": "test"}},
     )
     result = client.get_issue_resilient("XX-1")
     assert result.tier == "full"
@@ -194,7 +288,7 @@ def test_get_issue_resilient_falls_back_to_minimal(client, base_url, monkeypatch
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/issue/XX-1",
-        json={"key": "XX-1", "fields": {"summary": "ok"}},
+        json={"key": "XX-1", "id": "1", "fields": {"summary": "ok"}},
     )
 
     result = client.get_issue_resilient("XX-1")
@@ -235,7 +329,7 @@ def test_search_seek_default_tier_is_full(client, base_url):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -275,7 +369,7 @@ def test_search_seek_falls_back_to_hub(client, base_url, monkeypatch):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -324,7 +418,7 @@ def test_search_seek_falls_back_to_minimal(client, base_url, monkeypatch):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -388,7 +482,7 @@ def test_search_seek_hub_tier_tolerates_issuelinks_failure(client, base_url, mon
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -441,7 +535,7 @@ def test_get_issue_routes_through_resilient_tier(client, base_url, monkeypatch):
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/issue/XX-1",
-        json={"key": "XX-1", "fields": {"summary": "ok"}},
+        json={"key": "XX-1", "id": "1", "fields": {"summary": "ok"}},
     )
     responses.add(
         responses.GET,
@@ -506,7 +600,7 @@ def test_search_paged_falls_back_to_hub(client, base_url, monkeypatch):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "fields": {}}],
+            "issues": [{"key": "XX-1", "id": "1", "fields": {}}],
             "names": {},
             "schema": {},
             "total": 1,
@@ -581,7 +675,7 @@ def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "OK-1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "issues": [{"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -627,7 +721,7 @@ def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "OK-1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "issues": [{"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -665,7 +759,7 @@ def test_search_seek_recovers_from_invalid_key_format(client, base_url, monkeypa
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "OK-1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "issues": [{"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
             "names": {},
             "schema": {},
         },
@@ -700,3 +794,54 @@ def test_search_seek_propagates_400_when_after_key_is_none(client, base_url, mon
     )
     with pytest.raises(JiraJqlError):
         list(client.search_seek("PROJ"))  # no after_key set
+
+
+@responses.activate
+def test_search_seek_fallback_scans_by_id_not_key(client, base_url):
+    """The post-reindex fallback must page by issue id, not key.
+
+    JIRA evaluates `key > "X"` numerically (by issue number) but `ORDER BY key ASC`
+    lexically; mixing them makes a key cursor re-fetch the same page forever
+    (DMDSD-1, DMDSD-10, DMDSD-100 sort before DMDSD-2 lexically, yet a numeric
+    `key >` excludes them). This simulates that split semantics with a callback and
+    asserts the fallback advances by id and surfaces every issue. A key cursor would
+    loop on DMDSD-1/DMDSD-10 and never reach DMDSD-2 or DMDSD-20.
+    """
+    import json
+    import re
+    from datetime import UTC, datetime
+
+    # Lexically-scrambled keys with monotonic ids — the shape a key cursor breaks on.
+    universe = [
+        {"key": "DMDSD-1", "id": "100", "fields": {"updated": "2024-01-01T00:00:00.000+0000"}},
+        {"key": "DMDSD-10", "id": "101", "fields": {"updated": "2024-01-01T01:00:00.000+0000"}},
+        {"key": "DMDSD-100", "id": "102", "fields": {"updated": "2024-01-01T02:00:00.000+0000"}},
+        {"key": "DMDSD-2", "id": "103", "fields": {"updated": "2024-01-01T03:00:00.000+0000"}},
+        {"key": "DMDSD-20", "id": "104", "fields": {"updated": "2024-01-01T04:00:00.000+0000"}},
+    ]
+
+    def cb(request):
+        jql = json.loads(request.body)["jql"]
+        if "ORDER BY id ASC" in jql:  # fallback phase: honour the numeric id cursor
+            assert "ORDER BY key" not in jql, "fallback must not order by key"
+            m = re.search(r"id > (\d+)", jql)
+            after = int(m.group(1)) if m else 0
+            batch = [i for i in universe if int(i["id"]) > after][:2]
+            return (200, {}, json.dumps({"issues": batch, "names": {}, "schema": {}}))
+        # Time-cursor phase: simulate the reindex loop — same two issues every call.
+        return (200, {}, json.dumps({"issues": universe[:2], "names": {}, "schema": {}}))
+
+    responses.add_callback(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        callback=cb,
+        content_type="application/json",
+    )
+
+    pages = list(client.search_seek("DMDSD", after_ts=datetime(2026, 1, 1, tzinfo=UTC), page_size=2))
+    keys = {i["key"] for p in pages for i in p.issues}
+    assert keys == {"DMDSD-1", "DMDSD-10", "DMDSD-100", "DMDSD-2", "DMDSD-20"}
+    # The flag lets incremental callers tell recovery pages apart from the time
+    # cursor: the first page is time-cursor (False), the recovery scan is True.
+    assert pages[0].fallback is False
+    assert pages[-1].fallback is True
