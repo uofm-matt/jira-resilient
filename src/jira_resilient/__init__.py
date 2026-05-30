@@ -29,7 +29,7 @@ from jira_resilient.exceptions import (
 )
 from jira_resilient.jql import build_jql, build_seek_jql
 
-__version__ = "0.2.2"
+__version__ = "0.2.12"
 
 __all__ = [
     "JiraAuthError",
