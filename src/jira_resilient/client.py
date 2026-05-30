@@ -422,99 +422,124 @@ class JiraClient:
         extra_filter: str | None = None,
         page_size: int = _SEARCH_SEEK_PAGE_SIZE,
     ) -> Iterator[SearchPage]:
-        """Seek-paginated `/search`. Every request uses `startAt=0`.
+        """Seek-paginated `/search`, dispatched by intent on `after_ts`.
 
-        Cursor: `(after_ts, after_key)`. Each page advances the cursor to the last issue
-        returned. Per-request cost is bounded regardless of project size — JIRA Server's
-        offset pagination quadratic cost is sidestepped entirely.
+        - **Full scan** (`after_ts is None`): page the whole project by issue
+          `id` ascending (`_search_by_id`). `id` is a stable, exact, numeric,
+          monotonic cursor — immune to the minute-precision, reindex divergence,
+          and lexical-vs-numeric key pitfalls an `updated` cursor must work
+          around. It cannot loop, so it needs none of that machinery.
 
-        Two non-obvious behaviors handled here:
+        - **Delta** (`after_ts` set): page by the `(updated, key)` cursor for
+          issues changed since `after_ts` (`_search_by_updated`). That is the
+          only ordering that expresses "changed since X", and it carries the
+          reindex-recovery machinery because a server-side reindex makes the
+          `updated` cursor unreliable; on detecting a reindex loop it falls back
+          to a full `id` scan.
 
-        1. **JQL date minute-precision**: JQL `updated > "10:59"` actually matches anything
-           from 10:59:00.001 onwards. If two consecutive pages share the same boundary
-           row, the loop advances `after_ts` by one minute (keeping `after_key`) and
-           tries again — see the same-Lucene-timestamp group handling below.
-
-        2. **Lucene-reindex reconciliation**: when a JIRA server-side reindex stamps many
-           issues with a future indexed-`updated`, `fields.updated` in the response still
-           shows the original (older) timestamp. Setting `after_ts = fields.updated`
-           directly would cause the JQL to broaden backward and re-match every reindexed
-           issue from key=0 on the next request — an infinite loop. `after_ts` is kept
-           monotonically non-decreasing (`max(after_ts, new_ts)`) so the search window
-           can't regress. Combined with the minute-advance + `after_key` preservation
-           above, a reindexed same-timestamp group is paged through cleanly by key.
-
-        Raises `JiraParseError` if a returned issue is missing `fields.updated` or `key`.
-
-        Self-heals from a stale `after_key` (JIRA-deleted between cycles) by
-        clearing the tiebreaker on the next iteration when JIRA returns a
-        400-with-"key 'X' does not exist". Without this the loop would 400
-        forever — every cycle rebuilds the same broken JQL from the same
-        stored cursor key.
+        Every request uses `startAt=0`, so per-request cost stays bounded
+        regardless of project size — JIRA Server's offset-pagination quadratic
+        cost is sidestepped in both modes.
         """
-        # Last-N boundaries — detects longer cycles than the prev_boundary check.
-        # 3-key cycles within a single minute were observed in production on busy
-        # projects where JQL `updated > "X:Y"` (minute precision) re-matches every
-        # issue in the X:Y minute regardless of after_key. A simple prev-vs-current
-        # check misses these; a deque catches cycles of length up to maxlen-1.
+        if after_ts is None:
+            yield from self._search_by_id(
+                project_key, extra_filter=extra_filter, page_size=page_size
+            )
+        else:
+            yield from self._search_by_updated(
+                project_key,
+                after_ts=after_ts,
+                after_key=after_key,
+                extra_filter=extra_filter,
+                page_size=page_size,
+            )
+
+    def _search_by_id(
+        self,
+        project_key: str,
+        *,
+        extra_filter: str | None = None,
+        page_size: int = _SEARCH_SEEK_PAGE_SIZE,
+        after_id: int | None = None,
+        fallback: bool = False,
+    ) -> Iterator[SearchPage]:
+        """Page the whole project by issue `id` ascending until id exhaustion.
+
+        `id` uses one numeric ordering for both the `id > N` filter and the
+        `ORDER BY id ASC` sort, so the cursor advances monotonically and the scan
+        cannot loop — no cycle detection, minute-bump, or duplicate tracking
+        needed. Used for full loads and as `_search_by_updated`'s post-reindex
+        recovery (`fallback=True` tags those pages). Idempotent upserts on the
+        caller side absorb any overlap with earlier pages.
+        """
+        while True:
+            jql = f'project = "{project_key}"'
+            if after_id is not None:
+                jql += f" AND id > {after_id}"
+            if extra_filter:
+                jql += f" AND {extra_filter}"
+            jql += " ORDER BY id ASC"
+            data, tier = self._search_one_page(jql, page_size)
+            issues = data.get("issues") or []
+            if not issues:
+                break
+            yield SearchPage(
+                issues,
+                data.get("names") or {},
+                data.get("schema") or {},
+                tier=tier,
+                fallback=fallback,
+            )
+            # JIRA always returns `id`; issues are id-ascending so the last is the max.
+            after_id = int(issues[-1]["id"])
+
+    def _search_by_updated(
+        self,
+        project_key: str,
+        *,
+        after_ts: datetime,
+        after_key: str | None,
+        extra_filter: str | None,
+        page_size: int,
+    ) -> Iterator[SearchPage]:
+        """Delta scan by the `(updated, key)` cursor — issues changed since `after_ts`.
+
+        Handles two JIRA Server quirks the `updated` cursor runs into:
+
+        1. **JQL minute-precision**: `updated > "10:59"` matches from 10:59:00.001
+           on, so a same-minute cluster larger than one page can re-serve the same
+           boundary row forever. A repeated boundary (tracked in a deque to catch
+           multi-page cycles) triggers a one-minute bump of `after_ts`.
+
+        2. **Lucene-reindex divergence**: after a reindex, `fields.updated` lags the
+           index, so `updated >= X` matches everything regardless of X — an infinite
+           loop. Two detectors catch it — `stale_cycles` for the repeating-boundary
+           manifestation, a seen-key set for the yielded-duplicate manifestation —
+           and either switches to a full `id` scan via `_search_by_id`, which
+           terminates regardless of indexed timestamps.
+
+        Self-heals from a stale `after_key` (deleted/moved/malformed between cycles)
+        by dropping the tiebreaker when JIRA 400s on it.
+        """
         recent_boundaries: deque[tuple[datetime, str]] = deque(maxlen=10)
-        # Post-reindex stale detection — two complementary mechanisms:
-        #
-        # 1. stale_cycles: the loop manifests as a repeating page boundary (cluster
-        #    fits within deque maxlen-1 pages, so the bump path keeps firing). When a
-        #    boundary repeats and new_ts < bumped after_ts, the minute advance isn't
-        #    escaping — Lucene timestamps diverged from fields.updated. After
-        #    _STALE_CYCLE_LIMIT consecutive stale bumps → id-ordered fallback.
-        #
-        # 2. duplicate-key detection: the loop manifests as yielded pages (boundary
-        #    never repeats within the deque window). Once a full reindex cycle's keys
-        #    are in `seen_keys`, every further page is 100% duplicates. Tracking the
-        #    seen set is exact and data-independent — unlike a numeric key cursor,
-        #    which is unsound because JIRA orders keys lexically (the numeric suffix
-        #    is non-monotonic across digit boundaries: -1, -10, -11, …, -2, -20).
-        #    `seen_keys` is bounded by the project's issue count and freed when the
-        #    generator completes.
         _STALE_CYCLE_LIMIT = 3
         _STALE_DUP_LIMIT = 3
         stale_cycles = 0
         consecutive_dup_pages = 0
         seen_keys: set[str] = set()
-        using_key_fallback = False
-        after_id: int | None = None  # cursor for the id-ordered fallback scan
         while True:
-            if using_key_fallback:
-                # Post-reindex fallback: abandon the time cursor and scan by issue
-                # id ascending. A key cursor cannot work here — JIRA evaluates
-                # `key > "X"` numerically (by issue number) but `ORDER BY key ASC`
-                # lexically, and the two disagree across digit boundaries
-                # (DMDSD-1, DMDSD-10, DMDSD-100, DMDSD-1000, …). With a lexical sort
-                # the page's last key has a small number, so the numeric `key >`
-                # filter re-returns the same page forever. `id` has one consistent
-                # numeric ordering for both the filter and the sort, so this scan
-                # advances monotonically and terminates at id exhaustion. Idempotent
-                # upserts downstream absorb duplicates with the earlier time pages.
-                jql = f'project = "{project_key}"'
-                if after_id is not None:
-                    jql += f" AND id > {after_id}"
-                if extra_filter:
-                    jql += f" AND {extra_filter}"
-                jql += " ORDER BY id ASC"
-            else:
-                jql = build_seek_jql(
-                    project_key,
-                    after_ts=after_ts,
-                    after_key=after_key,
-                    extra_filter=extra_filter,
-                    tz=self.server_tz,
-                )
+            jql = build_seek_jql(
+                project_key,
+                after_ts=after_ts,
+                after_key=after_key,
+                extra_filter=extra_filter,
+                tz=self.server_tz,
+            )
             try:
                 data, tier = self._search_one_page(jql, page_size)
             except JiraJqlError as exc:
                 # Auto-recover from any "after_key references a key JIRA can't
                 # compare against" error (deleted, moved, or malformed key).
-                # Without after_key the JQL drops the `key > X` tiebreaker —
-                # broader query, but valid. Idempotent upserts on the caller
-                # side absorb any duplicates from the wider window.
                 if after_key and _is_stale_after_key_error(exc.error_messages):
                     logger.warning(
                         "seek tiebreaker after_key=%s rejected by JIRA (%s); "
@@ -547,44 +572,28 @@ class JiraClient:
             if new_ts is None or last_key is None:
                 raise JiraParseError(f"Page ended with row missing updated/key: {last!r}")
 
-            if using_key_fallback:
-                yield SearchPage(issues, names, schema, tier=tier, fallback=True)
-                # Issues are sorted by id ASC, so the last row holds the page's max
-                # id — JIRA always returns `id` on search results.
-                after_id = int(issues[-1]["id"])
-                continue
-
             current_boundary = (new_ts, last_key)
-            if current_boundary in recent_boundaries and after_ts is not None:
-                # Cycle detected (1-cycle = boundary repeat, N-cycle = same boundary seen
-                # within the last `maxlen` pages). Bump the minute past the current after_ts
-                # and clear after_key — the next iteration starts a fresh window at the new
-                # minute, no tiebreaker needed.
+            if current_boundary in recent_boundaries:
+                # Repeated boundary: a minute-precision cluster, or a reindex loop.
+                # Bump past the current minute and drop the tiebreaker.
                 bumped = (after_ts + timedelta(minutes=1)).replace(second=0, microsecond=0)
-                # Post-reindex stale-cycle detection: if fields.updated (new_ts) is still
-                # behind the bumped after_ts, the minute-advance isn't working — JIRA's
-                # Lucene index has diverged from fields.updated (post-reindex, all issues
-                # are re-indexed at the reindex time but fields.updated shows original
-                # timestamps). Count consecutive stale bumps; after the limit, switch to
-                # id-ordered pagination which terminates by id exhaustion regardless of
-                # JIRA's indexed timestamps.
-                if new_ts < bumped:
-                    stale_cycles += 1
-                else:
-                    stale_cycles = 0
+                # If fields.updated is still behind the bumped minute, the bump isn't
+                # escaping — Lucene has diverged from fields.updated (post-reindex).
+                stale_cycles = stale_cycles + 1 if new_ts < bumped else 0
                 if stale_cycles >= _STALE_CYCLE_LIMIT:
                     logger.warning(
                         "seek project=%s: %d consecutive stale minute-bumps "
-                        "(fields.updated=%s < after_ts=%s) — Lucene/field mismatch "
-                        "detected; switching to id-ordered fallback pagination",
+                        "(fields.updated=%s < after_ts=%s) — reindex detected; "
+                        "switching to id-ordered scan",
                         project_key,
                         stale_cycles,
                         new_ts,
                         after_ts,
                     )
-                    using_key_fallback = True
-                    recent_boundaries.clear()
-                    continue
+                    yield from self._search_by_id(
+                        project_key, extra_filter=extra_filter, page_size=page_size, fallback=True
+                    )
+                    return
                 after_ts = bumped
                 after_key = None
                 recent_boundaries.clear()
@@ -592,26 +601,17 @@ class JiraClient:
 
             yield SearchPage(issues, names, schema, tier=tier)
             recent_boundaries.append(current_boundary)
-            # Monotonic floor — normally advances after_ts to max(prev, new).
-            # Guard: when a full page returns with fields.updated far ahead of the
-            # current JQL minute, Lucene position ≠ fields.updated (bulk transition
-            # followed by later edits). Hold after_ts stable to exhaust the current
-            # minute cluster by key before advancing, preventing cursor jumps that
-            # abandon remaining cluster issues.
-            if (
-                after_ts is not None
-                and len(issues) == page_size
-                and new_ts > after_ts + timedelta(minutes=2)
-            ):
-                after_key = last_key  # stay in current minute, advance key only
-            else:
-                after_ts = new_ts if after_ts is None else max(after_ts, new_ts)
+            # Monotonic floor — advance after_ts to max(prev, new). Guard: when a full
+            # page's fields.updated is far ahead of the JQL minute (bulk transition then
+            # later edits), hold after_ts and advance by key to exhaust the cluster
+            # before jumping, so remaining cluster issues aren't abandoned.
+            if len(issues) == page_size and new_ts > after_ts + timedelta(minutes=2):
                 after_key = last_key
-            # Duplicate-key detection (mechanism 2 — yielded-page loop).
-            # A healthy page always contributes at least one key we haven't seen.
-            # A post-reindex loop re-yields a cycle of already-seen keys; once the
-            # set is saturated, every page is all-duplicates. _STALE_DUP_LIMIT
-            # consecutive zero-new-key pages → id-ordered fallback.
+            else:
+                after_ts = max(after_ts, new_ts)
+                after_key = last_key
+            # A reindex loop that never repeats a boundary instead re-yields seen keys.
+            # A healthy page always contributes at least one unseen key.
             if any(k not in seen_keys for issue in issues if (k := issue.get("key"))):
                 consecutive_dup_pages = 0
             else:
@@ -619,14 +619,15 @@ class JiraClient:
                 if consecutive_dup_pages >= _STALE_DUP_LIMIT:
                     logger.warning(
                         "seek project=%s: %d consecutive all-duplicate pages "
-                        "(last_key=%s) — Lucene/field mismatch detected; "
-                        "switching to id-ordered fallback pagination",
+                        "(last_key=%s) — reindex detected; switching to id-ordered scan",
                         project_key,
                         consecutive_dup_pages,
                         last_key,
                     )
-                    using_key_fallback = True
-                    seen_keys.clear()
+                    yield from self._search_by_id(
+                        project_key, extra_filter=extra_filter, page_size=page_size, fallback=True
+                    )
+                    return
             seen_keys.update(k for issue in issues if (k := issue.get("key")))
 
     def _search_one_page(self, jql: str, page_size: int, *, start_at: int = 0) -> tuple[dict, Tier]:

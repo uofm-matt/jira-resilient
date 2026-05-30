@@ -240,13 +240,18 @@ def test_search_seek_post_reindex_long_cycle_falls_back_to_key_only(client, base
 
 @responses.activate
 def test_search_seek_raises_parse_error_on_missing_updated(client, base_url):
+    """The delta path cursors on `updated`, so a page missing it is unrecoverable.
+    (A full scan cursors on `id` and never reads `updated`, so this guard is
+    delta-only — hence the after_ts.)"""
+    from datetime import datetime
+
     responses.add(
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={"issues": [{"key": "XX-1", "id": "1", "fields": {}}]},
     )
     with pytest.raises(JiraParseError):
-        list(client.search_seek("XX"))
+        list(client.search_seek("XX", after_ts=datetime(2026, 1, 1, tzinfo=UTC)))
 
 
 @responses.activate
@@ -706,7 +711,7 @@ def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch
     jte/OMDS (OMDS-3422 was moved between cycles). Same recovery as the
     deleted-key variant — clear after_key, retry."""
     import time
-    from datetime import UTC
+    from datetime import UTC, datetime
 
     monkeypatch.setattr(time, "sleep", lambda _: None)
     client._server_tz = UTC
@@ -732,7 +737,9 @@ def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch
         json={"issues": [], "names": {}, "schema": {}},
     )
 
-    pages = list(client.search_seek("PROJ", after_key="MOVED-42"))
+    pages = list(
+        client.search_seek("PROJ", after_ts=datetime(2026, 5, 20, tzinfo=UTC), after_key="MOVED-42")
+    )
     assert len(pages) == 1
     assert pages[0].issues[0]["key"] == "OK-1"
 
@@ -744,7 +751,7 @@ def test_search_seek_recovers_from_invalid_key_format(client, base_url, monkeypa
     happen naturally from seek pagination, but if cursor data ever gets
     corrupted, recover instead of looping forever."""
     import time
-    from datetime import UTC
+    from datetime import UTC, datetime
 
     monkeypatch.setattr(time, "sleep", lambda _: None)
     client._server_tz = UTC
@@ -770,7 +777,9 @@ def test_search_seek_recovers_from_invalid_key_format(client, base_url, monkeypa
         json={"issues": [], "names": {}, "schema": {}},
     )
 
-    pages = list(client.search_seek("PROJ", after_key="BROKEN"))
+    pages = list(
+        client.search_seek("PROJ", after_ts=datetime(2026, 5, 20, tzinfo=UTC), after_key="BROKEN")
+    )
     assert len(pages) == 1
 
 
@@ -845,3 +854,33 @@ def test_search_seek_fallback_scans_by_id_not_key(client, base_url):
     # cursor: the first page is time-cursor (False), the recovery scan is True.
     assert pages[0].fallback is False
     assert pages[-1].fallback is True
+
+
+@responses.activate
+def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
+    """A full load (no after_ts) pages by issue id ascending and never reads
+    `updated` — so it is structurally immune to the minute-precision and
+    Lucene-reindex pitfalls that the delta path must work around. The universe
+    issues deliberately omit `fields.updated` to prove it isn't consulted."""
+    import json
+    import re
+
+    seen_jql: list[str] = []
+    universe = [{"key": f"P-{i}", "id": str(i), "fields": {}} for i in range(1, 6)]
+
+    def cb(request):
+        jql = json.loads(request.body)["jql"]
+        seen_jql.append(jql)
+        m = re.search(r"id > (\d+)", jql)
+        after = int(m.group(1)) if m else 0
+        batch = [i for i in universe if int(i["id"]) > after][:2]
+        return (200, {}, json.dumps({"issues": batch, "names": {}, "schema": {}}))
+
+    responses.add_callback(
+        responses.POST, f"{base_url}/rest/api/2/search", callback=cb, content_type="application/json"
+    )
+    pages = list(client.search_seek("P"))
+    keys = [i["key"] for p in pages for i in p.issues]
+    assert keys == ["P-1", "P-2", "P-3", "P-4", "P-5"]
+    assert all("ORDER BY id ASC" in j for j in seen_jql)
+    assert all("updated" not in j for j in seen_jql)
