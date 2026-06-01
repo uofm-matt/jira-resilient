@@ -8,6 +8,7 @@ distinguish this library from the generic JIRA wrappers on PyPI.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections import deque
@@ -27,6 +28,10 @@ _LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for man
 _SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
 _SEARCH_PAGED_PAGE_SIZE = 50  # fields=*all without seek — older offset-paginated path
 
+# Consecutive reindex-loop signals before _search_by_updated bails to an id scan.
+_STALE_CYCLE_LIMIT = 3  # repeated page boundaries (minute-bump not escaping)
+_STALE_DUP_LIMIT = 3  # all-duplicate pages (boundary never repeats in the deque)
+
 # JIRA Server returns three distinct 400-error patterns when JQL `key > "X"`
 # references a key the server can't compare against. ALL of them wedge a seek
 # loop the same way (every subsequent cycle 400s forever until the cursor key
@@ -44,12 +49,10 @@ _STALE_KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _is_stale_after_key_error(error_messages: list[str]) -> bool:
-    """True iff any JIRA error message matches a known stale-after_key pattern."""
     return any(p.search(m) for m in error_messages for p in _STALE_KEY_PATTERNS)
 
 
 def _is_http_400(exc: BaseException) -> bool:
-    """True if exc is a requests.HTTPError carrying a 400 response."""
     return (
         isinstance(exc, requests.HTTPError)
         and exc.response is not None
@@ -58,26 +61,20 @@ def _is_http_400(exc: BaseException) -> bool:
 
 
 def _jql_error_from(exc: requests.HTTPError, jql: str) -> JiraJqlError:
-    """Build a JiraJqlError from a 400 response, preserving JIRA's
-    `errorMessages` list verbatim for caller introspection."""
+    """Preserve JIRA's `errorMessages` list verbatim for caller introspection."""
     messages: list[str] = []
-    try:
-        body = exc.response.json() if exc.response is not None else {}
-        messages = list(body.get("errorMessages") or [])
-    except (ValueError, AttributeError):
-        pass
+    with contextlib.suppress(ValueError, AttributeError):
+        messages = list(exc.response.json().get("errorMessages") or [])
     return JiraJqlError(f"JIRA rejected JQL: {jql!r}; messages={messages}", error_messages=messages)
 
 
-# Default minimal field set for the "minimal" fallback tier. Covers the JIRA core fields
-# most warehouse loaders care about; explicitly excludes description, comments,
-# attachments, custom fields (all of which can be huge on pathological issues).
+# Excludes description, comments, attachments, custom fields — all huge on
+# pathological issues. Kept to JIRA core fields the warehouse loaders need.
 _MINIMAL_FIELDS = (
     "summary,status,issuetype,priority,assignee,reporter,creator,"
     "labels,fixVersions,components,created,updated,resolutiondate,duedate,resolution"
 )
 
-# Same field set, but as a list for the POST-body form used by /search.
 _MINIMAL_FIELDS_LIST = _MINIMAL_FIELDS.split(",")
 
 
@@ -146,7 +143,7 @@ class JiraClient:
                 self._server_tz = datetime.fromisoformat(server_time).tzinfo
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 logger.warning("server_tz probe failed (%s) — falling back to UTC", exc)
-                self._server_tz = datetime.now().astimezone().tzinfo  # local; harmless when None
+            # UTC if the probe failed, or if serverTime parsed but was naive.
             if self._server_tz is None:
                 self._server_tz = UTC
         return self._server_tz
@@ -490,7 +487,6 @@ class JiraClient:
                 tier=tier,
                 fallback=fallback,
             )
-            # JIRA always returns `id`; issues are id-ascending so the last is the max.
             after_id = int(issues[-1]["id"])
 
     def _search_by_updated(
@@ -522,8 +518,6 @@ class JiraClient:
         by dropping the tiebreaker when JIRA 400s on it.
         """
         recent_boundaries: deque[tuple[datetime, str]] = deque(maxlen=10)
-        _STALE_CYCLE_LIMIT = 3
-        _STALE_DUP_LIMIT = 3
         stale_cycles = 0
         consecutive_dup_pages = 0
         seen_keys: set[str] = set()
@@ -560,11 +554,7 @@ class JiraClient:
             last_updated = (last.get("fields") or {}).get("updated")
             last_key = last.get("key")
             try:
-                new_ts = (
-                    datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
-                    if last_updated
-                    else None
-                )
+                new_ts = datetime.fromisoformat(last_updated) if last_updated else None
             except (AttributeError, ValueError) as exc:
                 raise JiraParseError(
                     f"Could not parse `updated` timestamp from JIRA: {last_updated!r}"
@@ -601,18 +591,18 @@ class JiraClient:
 
             yield SearchPage(issues, names, schema, tier=tier)
             recent_boundaries.append(current_boundary)
-            # Monotonic floor — advance after_ts to max(prev, new). Guard: when a full
-            # page's fields.updated is far ahead of the JQL minute (bulk transition then
-            # later edits), hold after_ts and advance by key to exhaust the cluster
-            # before jumping, so remaining cluster issues aren't abandoned.
-            if len(issues) == page_size and new_ts > after_ts + timedelta(minutes=2):
-                after_key = last_key
-            else:
+            # after_key always advances to the last row; after_ts is the conditional
+            # part. Monotonic floor — advance after_ts to max(prev, new). Guard: when a
+            # full page's fields.updated is far ahead of the JQL minute (bulk transition
+            # then later edits), hold after_ts and advance by key only, to exhaust the
+            # cluster before jumping so remaining cluster issues aren't abandoned.
+            after_key = last_key
+            if len(issues) < page_size or new_ts <= after_ts + timedelta(minutes=2):
                 after_ts = max(after_ts, new_ts)
-                after_key = last_key
-            # A reindex loop that never repeats a boundary instead re-yields seen keys.
-            # A healthy page always contributes at least one unseen key.
-            if any(k not in seen_keys for issue in issues if (k := issue.get("key"))):
+            # A reindex loop that never repeats a boundary instead re-yields seen keys:
+            # a healthy page always contributes at least one key we haven't seen.
+            page_keys = {k for issue in issues if (k := issue.get("key"))}
+            if page_keys - seen_keys:
                 consecutive_dup_pages = 0
             else:
                 consecutive_dup_pages += 1
@@ -628,7 +618,7 @@ class JiraClient:
                         project_key, extra_filter=extra_filter, page_size=page_size, fallback=True
                     )
                     return
-            seen_keys.update(k for issue in issues if (k := issue.get("key")))
+            seen_keys |= page_keys
 
     def _search_one_page(self, jql: str, page_size: int, *, start_at: int = 0) -> tuple[dict, Tier]:
         """Three-tier `/search` request mirroring `get_issue_resilient`'s shape.
