@@ -884,3 +884,27 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
     assert keys == ["P-1", "P-2", "P-3", "P-4", "P-5"]
     assert all("ORDER BY id ASC" in j for j in seen_jql)
     assert all("updated" not in j for j in seen_jql)
+
+
+@responses.activate
+def test_server_tz_falls_back_to_utc_on_probe_failure(client, base_url):
+    """When the /serverInfo probe fails, server_tz must fall back to UTC — not the
+    machine's local timezone. (Regression: the old code used the local TZ, which is
+    silently wrong anywhere the host clock isn't UTC, e.g. a non-UTC cloud region.)"""
+    from datetime import UTC
+
+    responses.add(responses.GET, f"{base_url}/rest/api/2/serverInfo", status=500)
+    assert client.server_tz is UTC
+
+
+@responses.activate
+def test_server_tz_uses_probed_offset(client, base_url):
+    """A successful probe adopts the JIRA server's reported offset."""
+    from datetime import timedelta
+
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/serverInfo",
+        json={"serverTime": "2026-05-19T13:00:00.000-0400"},
+    )
+    assert client.server_tz.utcoffset(None) == timedelta(hours=-4)
