@@ -2,6 +2,19 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] — 2026-06-03
+
+### Fixed
+- **`get_changelog` now works on JIRA Server.** It used the paginated
+  `/rest/api/2/issue/{key}/changelog` sub-resource — a JIRA Cloud / some-DC endpoint
+  that JIRA **Server** returns **404** for. The method now catches the 404 and falls
+  back to the inline `?expand=changelog` route (the only one Server offers), caching
+  the result per client so it doesn't re-probe the missing endpoint on every issue.
+  Previously *every* `get_changelog` call against JIRA Server raised `HTTPError` and the
+  changelog was silently dropped — it only surfaced when a hub/minimal-tier fallback
+  forced the call (large projects with slow search). Non-404 errors still propagate.
+  Affects all callers (delta sub-entity fetch + changelog backfill alike).
+
 ## [0.2.2] — 2026-05-20
 
 ### Fixed

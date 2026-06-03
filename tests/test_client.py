@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC
 
 import pytest
+import requests
 import responses
 
 from jira_resilient import JiraClient, JiraFetchError, JiraParseError
@@ -78,6 +79,37 @@ def test_get_changelog_paginates(client, base_url):
 
 
 @responses.activate
+def test_get_changelog_falls_back_to_expand_on_404(client, base_url):
+    # JIRA Server lacks the paginated sub-resource (404); fall back to expand=changelog.
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/changelog", status=404)
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1",
+        json={"key": "XX-1", "changelog": {"histories": [{"id": "10"}, {"id": "11"}]}},
+    )
+    assert client.get_changelog("XX-1") == [{"id": "10"}, {"id": "11"}]
+
+    # Cached: a subsequent issue goes straight to expand — no /changelog mock is
+    # registered for XX-2, so any call to the paginated route would raise.
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-2",
+        json={"changelog": {"histories": [{"id": "20"}]}},
+    )
+    assert client.get_changelog("XX-2") == [{"id": "20"}]
+
+
+@responses.activate
+def test_get_changelog_non_404_http_error_propagates(client, base_url):
+    # A non-404 HTTP error on the paginated route must NOT silently fall back to
+    # expand (no /issue/XX-1 mock is registered, so a fallback would also fail). 403
+    # is a fail-fast 4xx (unlike 5xx, which urllib3 retries).
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/changelog", status=403)
+    with pytest.raises(requests.HTTPError):
+        client.get_changelog("XX-1")
+
+
+@responses.activate
 def test_get_issuelinks_returns_field_value(client, base_url):
     responses.add(
         responses.GET,
@@ -90,7 +122,9 @@ def test_get_issuelinks_returns_field_value(client, base_url):
 @responses.activate
 def test_search_seek_yields_pages(client, base_url):
     p1 = {
-        "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+        "issues": [
+            {"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}
+        ],
         "names": {},
         "schema": {},
     }
@@ -119,7 +153,9 @@ def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
         "schema": {},
     }
     after_page = {
-        "issues": [{"key": "XX-300", "id": "300", "fields": {"updated": "2026-05-19T11:53:00.000-0400"}}],
+        "issues": [
+            {"key": "XX-300", "id": "300", "fields": {"updated": "2026-05-19T11:53:00.000-0400"}}
+        ],
         "names": {},
         "schema": {},
     }
@@ -334,7 +370,9 @@ def test_search_seek_default_tier_is_full(client, base_url):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [
+                {"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -374,7 +412,9 @@ def test_search_seek_falls_back_to_hub(client, base_url, monkeypatch):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [
+                {"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -423,7 +463,9 @@ def test_search_seek_falls_back_to_minimal(client, base_url, monkeypatch):
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [
+                {"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -487,7 +529,9 @@ def test_search_seek_hub_tier_tolerates_issuelinks_failure(client, base_url, mon
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}],
+            "issues": [
+                {"key": "XX-1", "id": "1", "fields": {"updated": "2026-05-18T07:30:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -680,7 +724,9 @@ def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "issues": [
+                {"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -726,7 +772,9 @@ def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "issues": [
+                {"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -766,7 +814,9 @@ def test_search_seek_recovers_from_invalid_key_format(client, base_url, monkeypa
         responses.POST,
         f"{base_url}/rest/api/2/search",
         json={
-            "issues": [{"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}],
+            "issues": [
+                {"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}
+            ],
             "names": {},
             "schema": {},
         },
@@ -847,7 +897,9 @@ def test_search_seek_fallback_scans_by_id_not_key(client, base_url):
         content_type="application/json",
     )
 
-    pages = list(client.search_seek("PROJ", after_ts=datetime(2026, 1, 1, tzinfo=UTC), page_size=2))
+    pages = list(
+        client.search_seek("PROJ", after_ts=datetime(2026, 1, 1, tzinfo=UTC), page_size=2)
+    )
     keys = {i["key"] for p in pages for i in p.issues}
     assert keys == {"PROJ-1", "PROJ-10", "PROJ-100", "PROJ-2", "PROJ-20"}
     # The flag lets incremental callers tell recovery pages apart from the time
@@ -877,7 +929,10 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
         return (200, {}, json.dumps({"issues": batch, "names": {}, "schema": {}}))
 
     responses.add_callback(
-        responses.POST, f"{base_url}/rest/api/2/search", callback=cb, content_type="application/json"
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        callback=cb,
+        content_type="application/json",
     )
     pages = list(client.search_seek("P"))
     keys = [i["key"] for p in pages for i in p.issues]

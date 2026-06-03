@@ -107,6 +107,10 @@ class JiraClient:
         self.max_attempts = max_attempts
         self.session = make_session(pat, verify)
         self._server_tz: tzinfo | None = None
+        # JIRA Cloud / some DC builds expose a paginated /issue/{key}/changelog
+        # sub-resource; JIRA Server returns 404 for it. Probe once, then cache so we
+        # use the inline ?expand=changelog route directly on Server (see get_changelog).
+        self._changelog_paginated = True
 
     # ----- auth ---------------------------------------------------------------
 
@@ -216,13 +220,28 @@ class JiraClient:
         return (data.get("fields") or {}).get("issuelinks") or []
 
     def get_changelog(self, key: str, *, page_size: int = 100) -> list[dict]:
-        """Full changelog via the paginated endpoint (JIRA Server 8.6+).
+        """Full changelog as a flat history-entry list.
 
-        Returns the flat history-entry list. Small per-page payloads keep each
-        request well under the 120s timeout even for issues with thousands of
-        history entries — where the inline `expand=changelog` route would return
-        everything in one shot and time out.
+        Prefers the paginated `/issue/{key}/changelog` sub-resource (small per-page
+        payloads stay under the timeout even for thousands of entries). That route is
+        a JIRA Cloud / some-DC feature, though — JIRA **Server** returns 404 for it,
+        in which case we fall back to the inline `?expand=changelog` route (the only
+        one Server offers). The 404 result is cached on the client so we don't re-probe
+        the missing endpoint on every issue.
         """
+        if self._changelog_paginated:
+            try:
+                return self._changelog_paged(key, page_size)
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                self._changelog_paginated = False
+                logger.info(
+                    "paginated changelog endpoint not available (404) — using ?expand=changelog"
+                )
+        return self._changelog_expand(key)
+
+    def _changelog_paged(self, key: str, page_size: int) -> list[dict]:
         url = f"{self.base_url}/rest/api/2/issue/{key}/changelog"
         histories: list[dict] = []
         start_at = 0
@@ -241,6 +260,19 @@ class JiraClient:
             if not page or start_at >= data.get("total", 0):
                 break
         return histories
+
+    def _changelog_expand(self, key: str) -> list[dict]:
+        """JIRA Server changelog: the issue resource with `expand=changelog`. Returns
+        the full history in one response (`changelog.histories`)."""
+        data = request_with_retry(
+            self.session,
+            "GET",
+            f"{self.base_url}/rest/api/2/issue/{key}",
+            params={"expand": "changelog", "fields": "summary"},
+            timeout=self.timeout,
+            max_attempts=self.max_attempts,
+        ).json()
+        return data.get("changelog", {}).get("histories", [])
 
     def get_worklogs(self, key: str, *, page_size: int = 100) -> list[dict]:
         """Full worklog list via paginated `/rest/api/2/issue/{key}/worklog`.
@@ -303,13 +335,16 @@ class JiraClient:
         JIRA returns all remote links in a single non-paginated response.
         """
         url = f"{self.base_url}/rest/api/2/issue/{key}/remotelink"
-        return request_with_retry(
-            self.session,
-            "GET",
-            url,
-            timeout=30,
-            max_attempts=3,
-        ).json() or []
+        return (
+            request_with_retry(
+                self.session,
+                "GET",
+                url,
+                timeout=30,
+                max_attempts=3,
+            ).json()
+            or []
+        )
 
     def get_issue_resilient(self, key: str) -> ResilientFetchResult:
         """Three-tier resilient fetch.
