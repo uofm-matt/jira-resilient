@@ -2,6 +2,30 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1] — 2026-06-04
+
+Documentation + packaging only — **no functional change**; the API and behavior are
+identical to 0.4.0.
+
+### Documentation
+- **Completed the README API reference**, which had drifted to ~half the surface.
+  Added the sub-entity reads (`get_comments` / `get_worklogs` / `get_remote_links`),
+  the watchers / voters / user / entity-property methods, and the `server_tz`
+  property; corrected the `get_changelog` note (paginated route 404s on JIRA Server
+  → automatic `?expand=changelog` fallback) and the `search_seek` note (full scans
+  page by `id`, deltas by `(updated, key)`).
+- **Backfilled the missing `0.3.0` and `0.3.1` changelog entries.**
+
+### Fixed
+- **CI release-notes extraction.** The publish workflow matched the version header
+  as a regex, so `## [x.y.z]` (where `[`, `]`, `.` are regex metacharacters) never
+  matched and every published GitHub Release got a stub body instead of its
+  changelog section. Now matched as a literal prefix; existing releases re-synced.
+
+### Changed
+- Docs, tests, and code comments now use neutral, generic example identifiers
+  throughout.
+
 ## [0.4.0] — 2026-06-04
 
 ### Added
