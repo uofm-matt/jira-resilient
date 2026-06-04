@@ -703,7 +703,7 @@ def test_search_400_raises_jql_error_immediately(client, base_url, monkeypatch):
 def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch):
     """End-to-end: seek loop sees 400 'key X does not exist', clears its stale
     tiebreaker, retries the same window without `key > X`, and continues. This
-    is the PROJ-style operator pain point — without auto-recovery the loop
+    is the operator pain point — without auto-recovery the loop
     would 400 forever once an admin deleted a previous cycle's last_seen_key.
     """
     import time
@@ -753,8 +753,8 @@ def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch
 @responses.activate
 def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch):
     """Variant: JIRA returns 'Operator '>' cannot be applied to moved issue
-    key 'X'' when after_key references a reprojected issue. Hit live on
-    a project (PROJ-1234 was moved between cycles). Same recovery as the
+    key 'X'' when after_key references a reprojected issue. Hit in production
+    when an issue was moved between cycles. Same recovery as the
     deleted-key variant — clear after_key, retry."""
     import time
     from datetime import UTC, datetime
@@ -897,9 +897,7 @@ def test_search_seek_fallback_scans_by_id_not_key(client, base_url):
         content_type="application/json",
     )
 
-    pages = list(
-        client.search_seek("PROJ", after_ts=datetime(2026, 1, 1, tzinfo=UTC), page_size=2)
-    )
+    pages = list(client.search_seek("PROJ", after_ts=datetime(2026, 1, 1, tzinfo=UTC), page_size=2))
     keys = {i["key"] for p in pages for i in p.issues}
     assert keys == {"PROJ-1", "PROJ-10", "PROJ-100", "PROJ-2", "PROJ-20"}
     # The flag lets incremental callers tell recovery pages apart from the time
@@ -1122,7 +1120,7 @@ def test_get_properties_skips_individual_404(client, base_url):
 @responses.activate
 def test_get_comment_properties_404_endpoint_returns_empty(client, base_url):
     """Some JIRA Server builds don't expose the comment-properties sub-resource —
-    a wholesale 404 must collapse to {} (observed live on the instance)."""
+    a wholesale 404 must collapse to {} (observed live in production)."""
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/issue/XX-1/comment/99/properties",

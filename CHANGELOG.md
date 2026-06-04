@@ -9,7 +9,7 @@ All notable changes will be documented here. Format: [Keep a Changelog](https://
 Six new single-entity read methods on `JiraClient`, each mirroring the existing
 `get_comments` / `get_worklogs` / `get_remote_links` style (retry-with-backoff,
 JIRA-Server REST endpoints, graceful absence handling). All endpoint shapes were
-verified live against the instance (JIRA Server x.y.z) before release.
+verified live against a JIRA Server x.y.z instance before release.
 
 - **`get_watchers(key) -> list[dict]`** — `GET /rest/api/2/issue/{key}/watchers`,
   returns the `watchers` array (full user objects). The watcher *count* is already
@@ -31,7 +31,7 @@ verified live against the instance (JIRA Server x.y.z) before release.
 - **`get_comment_properties(issue_key, comment_id) -> dict[str, Any]`** — same
   pattern under `/issue/{key}/comment/{id}/properties`. Some JIRA Server builds
   do not expose this sub-resource at all (observed returning 404 wholesale on
-  the instance's Service Desk projects) — that collapses to `{}` rather than raising.
+  some Service Desk projects) — that collapses to `{}` rather than raising.
 - **`get_project_properties(project_key) -> dict[str, Any]`** — same pattern under
   `/project/{key}/properties`.
 
@@ -52,6 +52,46 @@ verified live against the instance (JIRA Server x.y.z) before release.
   forced the call (large projects with slow search). Non-404 errors still propagate.
   Affects all callers (delta sub-entity fetch + changelog backfill alike).
 
+## [0.3.1] — 2026-06-01
+
+### Fixed
+- **`server_tz` falls back to UTC on probe failure, not the host's local timezone.**
+  When the `/rest/api/2/serverInfo` probe failed (or returned an unparseable
+  `serverTime`), the property previously fell through to the *machine's* local
+  timezone — silently wrong on any non-UTC host (a cloud runner defaulting to UTC
+  vs a developer's local box), shifting every delta sync's JQL window by the host
+  offset. Now the fallback is always UTC, which is at worst the same behavior
+  callers had before any TZ handling existed. Regression tests added for both the
+  probe-success (server offset honored) and probe-failure (UTC) paths.
+
+### Changed
+- **Behavior-preserving tightening pass.** Trimmed docstrings/comments that merely
+  restate names; hoisted the stale-`after_key` detection limits to module
+  constants; `datetime.fromisoformat` now parses the `Z`/offset suffix natively
+  (dropped the manual `.replace("Z", "+00:00")`); de-duplicated the `after_key`
+  assignment; switched duplicate detection to set subtraction; `contextlib.suppress`
+  in the JQL-error path. No surface or behavior change beyond the `server_tz` fix.
+
+## [0.3.0] — 2026-05-30
+
+### Changed
+- **`search_seek` now dispatches by intent on `after_ts` — full scans page by issue
+  `id`, deltas by `(updated, key)`.** A full load (`after_ts is None`) pages the
+  whole project by issue **`id` ascending** (`_search_by_id`): one numeric ordering
+  drives both the `id > N` filter and the `ORDER BY id ASC` sort, so the cursor
+  advances monotonically and the scan **cannot loop**. It needs none of the cycle
+  detection, minute-bump, or duplicate-tracking the `updated` cursor requires, and
+  is structurally immune to the JQL minute-precision and Lucene-reindex pitfalls
+  those guards exist for. A delta load (`after_ts` set) keeps the `(updated, key)`
+  cursor (`_search_by_updated`) — the only ordering that expresses "changed since
+  X" — and its reindex recovery now *delegates* to the same `_search_by_id`, so the
+  id-scan logic lives in exactly one place; on detecting a reindex loop the delta
+  path falls back to a full `id` scan. The `updated`-parse and stale-`after_key`
+  guards are now delta-only (a full scan never reads `updated` or uses `after_key`).
+- Live-validated by a full nuke-and-reload of two large instances (hundreds of
+  thousands of issues), which reproduced live JIRA exactly per project with
+  **zero** reindex-recovery machinery firing — the full path scans purely by `id`.
+
 ## [0.2.2] — 2026-05-20
 
 ### Fixed
@@ -59,7 +99,7 @@ verified live against the instance (JIRA Server x.y.z) before release.
   in addition to the deleted-issue case shipped in 0.2.1:
   - `"Operator '>' cannot be applied to moved issue key 'X'."` — fires
     when the cursor's last_seen_key was reprojected to another project.
-    Hit live on a project (PROJ-1234) one hour after the 0.2.1 deploy.
+    Hit in production one hour after the 0.2.1 deploy.
   - `"The issue key 'X' for field 'key' is invalid."` — defensive: fires
     if cursor data is somehow malformed (no dash, wrong shape). Doesn't
     happen organically from the seek loop but recovers if it ever does.
@@ -169,7 +209,7 @@ only callers using the kwargs need to switch to `get_issue_raw`.
   — the existing positional `(issues, names, schema)` destructuring still works.
 
 ### Fixed
-- **PROJ-class hub timeouts no longer block delta sync.** Before 0.1.3, a
+- **Large-hub timeouts no longer block delta sync.** Before 0.1.3, a
   single hub issue with 5000+ `issuelinks` falling into the delta window
   would 120s-timeout every `/search` page that contained it — and on busy
   projects that's every page until the hub's `updated` rolled past. The

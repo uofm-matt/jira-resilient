@@ -73,7 +73,7 @@ Every JIRA Python client on PyPI today (`jira`, `atlassian-python-api`, `pycontr
 | **Hub issues with thousands of issuelinks** — `fields=*all` payload exceeds 120s timeout, request fails | issue unrecoverable, silently absent from your data | three-tier fetch: `full` → `*all,-issuelinks` + separate links fetch with long timeout → minimal fields |
 | 100K+ issue projects — offset pagination is ~O(n²) on JIRA Server | "limit your queries" (Atlassian's documented guidance) | `search_seek` — `(updated, key)` tuple cursor in JQL, `startAt=0` every request, bounded per-page cost |
 | Lucene reindex makes seek cursors silently regress | n/a — no client implements seek | monotonic `after_ts` floor + minute-advance fallback (the war story below) |
-| Huge changelogs overflow `expand=changelog` | request fails; history lost | paginated `/issue/{key}/changelog` |
+| Huge changelogs overflow `expand=changelog` | request fails; history lost | paginated `/issue/{key}/changelog`, auto-falling back to `?expand=changelog` on JIRA Server (which 404s the paginated route) |
 | 4xx in the retry loop | exponential backoff over a permission error wastes 15 min | fail-fast on 4xx; only 429/5xx trigger backoff |
 
 ### The hub-issue problem, in detail
@@ -109,18 +109,51 @@ The fix: `after_ts` is kept **monotonically non-decreasing** — `after_ts = max
 
 `JiraClient(base_url, pat, *, verify=True, timeout=120, max_attempts=5)`
 
+**Auth & server**
+
 | Method | Endpoint | Notes |
 |---|---|---|
 | `is_authenticated` (prop) | `GET /myself` | Logs displayName on success |
-| **`get_issue_resilient(key)`** | three-tier | **The killer feature.** Returns `ResilientFetchResult(issue, tier)` |
-| `get_issue(key, *, expand, fields, …)` | `GET /issue/{key}` | Defaults to `fields=*all` + changelog |
-| `get_issue_minimal(key)` | `GET /issue/{key}` | Small-field set, short timeout |
-| `get_issuelinks(key, *, timeout=600)` | `GET /issue/{key}` | Long default timeout for hub issues |
-| `get_changelog(key, *, page_size=100)` | `GET /issue/{key}/changelog` | Paginated; survives huge histories |
+| `server_tz` (prop) | `GET /serverInfo` | Server's local timezone, probed once + cached. JQL date literals are parsed in *this* TZ, not UTC; `search_seek` passes it to the JQL builder automatically. Falls back to UTC if the probe fails |
+
+**Single-issue fetch**
+
+| Method | Endpoint | Notes |
+|---|---|---|
+| **`get_issue_resilient(key)`** | three-tier | **The killer feature.** `ResilientFetchResult(issue, tier)` — `full` → `hub` (`*all,-issuelinks` + a separate links fetch) → `minimal` |
+| `get_issue(key)` | three-tier | Safe default — routes through `get_issue_resilient`, returns the issue dict |
+| `get_issue_raw(key, *, expand, fields, timeout, max_attempts)` | `GET /issue/{key}` | Escape hatch, **no** fallback — direct control for fast-fail probes |
+| `get_issue_minimal(key)` | `GET /issue/{key}` | Small field set, short timeout, no changelog |
+| `get_issuelinks(key, *, timeout=600)` | `GET /issue/{key}` | Only `issuelinks`; long timeout for hub issues |
+
+**Sub-entity reads** — the bits search responses truncate or omit, for faithful extraction
+
+| Method | Endpoint | Notes |
+|---|---|---|
+| `get_changelog(key, *, page_size=100)` | `GET /issue/{key}/changelog` | Paginated; **auto-falls back to `?expand=changelog` on JIRA Server** (which 404s the paginated route), cached per client |
+| `get_comments(key, *, page_size=50)` | `GET /issue/{key}/comment` | Full comment history (search caps inline comments) |
+| `get_worklogs(key, *, page_size=100)` | `GET /issue/{key}/worklog` | Full worklog history (search inlines ≤ 20) |
+| `get_remote_links(key)` | `GET /issue/{key}/remotelink` | Confluence / GitHub / URL links — never in search responses |
+| `get_watchers(key)` | `GET /issue/{key}/watchers` | Watcher identities; `[]` on 404; needs "View Voters and Watchers" |
+| `get_voters(key)` | `GET /issue/{key}/votes` | Voter identities; `[]` on 404 |
+
+**Entity properties** — list-then-dereference to `{propertyKey: value}`; `?expand=properties` returns null on Server, so these dedicated sub-resources are the only way to read them. `{}` when absent.
+
+| Method | Endpoint |
+|---|---|
+| `get_issue_properties(key)` | `GET /issue/{key}/properties` |
+| `get_comment_properties(issue_key, comment_id)` | `GET /issue/{key}/comment/{id}/properties` |
+| `get_project_properties(project_key)` | `GET /project/{key}/properties` |
+
+**Users · fields · listing · pagination**
+
+| Method | Endpoint | Notes |
+|---|---|---|
+| `get_user(*, username/key/account_id, expand="groups,applicationRoles")` | `GET /user` | Resolved by the right param per deployment (Server: `username`/`key`; Cloud: `accountId`); `{}` on 404 |
 | `list_fields()` | `GET /field` | Full field catalog |
 | `list_keys(jql)` | `POST /search` (fields=key) | Tiny payload; for reconciliation |
 | `search_paged(jql, *, page_size=50)` | `POST /search` (offset) | Use sparingly — quadratic on large projects |
-| `search_seek(project_key, *, after_ts, after_key, extra_filter, page_size=20)` | `POST /search` (seek) | For project-wide enumeration |
+| `search_seek(project_key, *, after_ts, after_key, extra_filter, page_size=20)` | `POST /search` (seek) | Project-wide enumeration. **Full scan** (`after_ts=None`) pages by issue `id` (monotonic, can't loop); **delta** (`after_ts` set) by `(updated, key)` with Lucene-reindex recovery |
 
 ### Exceptions
 
@@ -132,6 +165,8 @@ from jira_resilient import (
     JiraFetchError,       # all retry attempts / fallback tiers exhausted
 )
 ```
+
+`JiraJqlError` (subclass of `JiraResilientError`, importable from `jira_resilient.exceptions`) is raised when JIRA rejects a query with HTTP 400 — it carries `error_messages: list[str]` from JIRA's response body so callers can pattern-match. `search_seek` uses it internally to decide whether a stale-cursor 400 is auto-recoverable.
 
 `requests.RequestException` may still escape on conditions the library doesn't wrap. Catch `JiraResilientError` for library-raised failures, or `Exception` for everything.
 
