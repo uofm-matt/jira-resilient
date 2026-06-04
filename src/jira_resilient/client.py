@@ -37,8 +37,8 @@ _STALE_DUP_LIMIT = 3  # all-duplicate pages (boundary never repeats in the deque
 # references a key the server can't compare against. ALL of them wedge a seek
 # loop the same way (every subsequent cycle 400s forever until the cursor key
 # is cleared), so all three trigger the same auto-recovery: drop after_key,
-# retry. Patterns observed in prod 2026-05-20 (PROJ-1 deleted, PROJ-1234
-# reprojected) plus the malformed-key variant added defensively.
+# retry. Two were observed in production (a deleted key and a reprojected key);
+# the malformed-key variant was added defensively.
 _STALE_KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Issue was deleted (or never existed).
     re.compile(r"An issue with key '([^']+)' does not exist for field 'key'"),
@@ -78,7 +78,7 @@ def _jql_error_from(exc: requests.HTTPError, jql: str) -> JiraJqlError:
 
 
 # Excludes description, comments, attachments, custom fields — all huge on
-# pathological issues. Kept to JIRA core fields the warehouse loaders need.
+# pathological issues. Kept to the JIRA core fields a data-warehouse loader needs.
 _MINIMAL_FIELDS = (
     "summary,status,issuetype,priority,assignee,reporter,creator,"
     "labels,fixVersions,components,created,updated,resolutiondate,duedate,resolution"

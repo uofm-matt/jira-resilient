@@ -23,15 +23,17 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
       # Extract the changelog entry for this tag and create a GitHub Release.
-      # awk pattern: print lines between `## [X.Y.Z]` header and the next
-      # `## [` header (exclusive), drop the trailing blank.  Falls back to
-      # an empty body if the section isn't found.
+      # Print lines between the `## [X.Y.Z]` header and the next `## [` header
+      # (exclusive). The header is matched as a LITERAL prefix via index(), not a
+      # regex — `## [X.Y.Z]` as a regex treats `[`/`]`/`.` as metacharacters and
+      # never matches, which silently stubbed every release's notes. Falls back to
+      # a pointer if the section isn't found.
       - name: Extract release notes from CHANGELOG
         id: notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           awk -v ver="## [$VERSION]" '
-            $0 ~ ver {flag=1; next}
+            index($0, ver) == 1 {flag=1; next}
             /^## \[/ {flag=0}
             flag {print}
           ' CHANGELOG.md > /tmp/release_notes.md
