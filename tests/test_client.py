@@ -963,3 +963,199 @@ def test_server_tz_uses_probed_offset(client, base_url):
         json={"serverTime": "2026-05-19T13:00:00.000-0400"},
     )
     assert client.server_tz.utcoffset(None) == timedelta(hours=-4)
+
+
+# ----- watchers / voters --------------------------------------------------------
+
+
+@responses.activate
+def test_get_watchers_returns_watchers_array(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/watchers",
+        json={
+            "watchCount": 2,
+            "isWatching": False,
+            "watchers": [
+                {"name": "alice", "key": "JIRAUSER1", "active": True},
+                {"name": "bob", "key": "JIRAUSER2", "active": True},
+            ],
+        },
+    )
+    watchers = client.get_watchers("XX-1")
+    assert [w["name"] for w in watchers] == ["alice", "bob"]
+
+
+@responses.activate
+def test_get_watchers_returns_empty_on_404(client, base_url):
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/watchers", status=404)
+    assert client.get_watchers("XX-1") == []
+
+
+@responses.activate
+def test_get_voters_returns_voters_array(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/votes",
+        json={"votes": 1, "hasVoted": False, "voters": [{"name": "carol", "key": "JIRAUSER3"}]},
+    )
+    assert client.get_voters("XX-1") == [{"name": "carol", "key": "JIRAUSER3"}]
+
+
+@responses.activate
+def test_get_voters_empty_when_no_votes(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/votes",
+        json={"votes": 0, "voters": [], "hasVoted": False},
+    )
+    assert client.get_voters("XX-1") == []
+
+
+@responses.activate
+def test_get_voters_returns_empty_on_404(client, base_url):
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/votes", status=404)
+    assert client.get_voters("XX-1") == []
+
+
+# ----- user ---------------------------------------------------------------------
+
+
+@responses.activate
+def test_get_user_by_username(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/user",
+        json={"name": "alice", "key": "JIRAUSER1", "emailAddress": "a@x", "active": True},
+    )
+    user = client.get_user(username="alice")
+    assert user["key"] == "JIRAUSER1"
+    assert responses.calls[0].request.params["username"] == "alice"
+    # expand defaults to groups,applicationRoles
+    assert responses.calls[0].request.params["expand"] == "groups,applicationRoles"
+
+
+@responses.activate
+def test_get_user_by_key_with_expand_none(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/user",
+        json={"name": "alice", "key": "JIRAUSER1"},
+    )
+    client.get_user(key="JIRAUSER1", expand=None)
+    assert responses.calls[0].request.params["key"] == "JIRAUSER1"
+    assert "expand" not in responses.calls[0].request.params
+
+
+@responses.activate
+def test_get_user_returns_empty_on_404(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/user",
+        json={"errorMessages": ["The user named 'nope' does not exist"]},
+        status=404,
+    )
+    assert client.get_user(username="nope") == {}
+
+
+def test_get_user_requires_an_identifier(client):
+    with pytest.raises(ValueError, match="username, key, or account_id"):
+        client.get_user()
+
+
+# ----- entity properties --------------------------------------------------------
+
+
+@responses.activate
+def test_get_issue_properties_lists_then_dereferences(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/properties",
+        json={"keys": [{"key": "p.one"}, {"key": "p.two"}]},
+    )
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/properties/p.one",
+        json={"key": "p.one", "value": {"a": 1}},
+    )
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/properties/p.two",
+        json={"key": "p.two", "value": "literal"},
+    )
+    assert client.get_issue_properties("XX-1") == {"p.one": {"a": 1}, "p.two": "literal"}
+
+
+@responses.activate
+def test_get_issue_properties_empty_list(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/properties",
+        json={"keys": []},
+    )
+    assert client.get_issue_properties("XX-1") == {}
+
+
+@responses.activate
+def test_get_issue_properties_404_list_returns_empty(client, base_url):
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/properties", status=404)
+    assert client.get_issue_properties("XX-1") == {}
+
+
+@responses.activate
+def test_get_properties_skips_individual_404(client, base_url):
+    """A value that 404s between listing and dereferencing is skipped, not fatal."""
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/properties",
+        json={"keys": [{"key": "gone"}, {"key": "here"}]},
+    )
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/properties/gone", status=404)
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/properties/here",
+        json={"key": "here", "value": 42},
+    )
+    assert client.get_issue_properties("XX-1") == {"here": 42}
+
+
+@responses.activate
+def test_get_comment_properties_404_endpoint_returns_empty(client, base_url):
+    """Some JIRA Server builds don't expose the comment-properties sub-resource —
+    a wholesale 404 must collapse to {} (observed live on the instance)."""
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/comment/99/properties",
+        status=404,
+    )
+    assert client.get_comment_properties("XX-1", "99") == {}
+
+
+@responses.activate
+def test_get_project_properties_lists_then_dereferences(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/project/PROJ/properties",
+        json={"keys": [{"key": "searchRequests"}]},
+    )
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/project/PROJ/properties/searchRequests",
+        json={"key": "searchRequests", "value": {"ids": []}},
+    )
+    assert client.get_project_properties("PROJ") == {"searchRequests": {"ids": []}}
+
+
+@responses.activate
+def test_get_comment_properties_lists_then_dereferences(client, base_url):
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/comment/99/properties",
+        json={"keys": [{"key": "sd.public.comment"}]},
+    )
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/comment/99/properties/sd.public.comment",
+        json={"key": "sd.public.comment", "value": {"internal": False}},
+    )
+    assert client.get_comment_properties("XX-1", "99") == {"sd.public.comment": {"internal": False}}

@@ -2,6 +2,43 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] — 2026-06-04
+
+### Added
+
+Six new single-entity read methods on `JiraClient`, each mirroring the existing
+`get_comments` / `get_worklogs` / `get_remote_links` style (retry-with-backoff,
+JIRA-Server REST endpoints, graceful absence handling). All endpoint shapes were
+verified live against the instance (JIRA Server x.y.z) before release.
+
+- **`get_watchers(key) -> list[dict]`** — `GET /rest/api/2/issue/{key}/watchers`,
+  returns the `watchers` array (full user objects). The watcher *count* is already
+  on the issue payload (`fields.watches.watchCount`); this is the identity list,
+  and requires the "View Voters and Watchers" permission. Returns `[]` on 404.
+- **`get_voters(key) -> list[dict]`** — `GET /rest/api/2/issue/{key}/votes`,
+  returns the `voters` array (user objects). Returns `[]` on 404.
+- **`get_user(*, username=None, key=None, account_id=None, expand="groups,applicationRoles") -> dict`**
+  — `GET /rest/api/2/user` resolved by the right param for the deployment
+  (`username=` / `key=` on Server, `accountId=` on Cloud). Returns the user object
+  (`emailAddress`, `active`, `timeZone`, `locale`, `displayName`). `expand` defaults
+  to `groups,applicationRoles` because JIRA Server otherwise returns those
+  collections with `size` set but `items` empty; pass `expand=None` to skip.
+  Returns `{}` on 404 (unknown user).
+- **`get_issue_properties(key) -> dict[str, Any]`** — lists
+  `/rest/api/2/issue/{key}/properties` then dereferences each value, returning
+  `{propertyKey: value}`. `?expand=properties` returns null on Server, so the
+  dedicated sub-resource is required.
+- **`get_comment_properties(issue_key, comment_id) -> dict[str, Any]`** — same
+  pattern under `/issue/{key}/comment/{id}/properties`. Some JIRA Server builds
+  do not expose this sub-resource at all (observed returning 404 wholesale on
+  the instance's Service Desk projects) — that collapses to `{}` rather than raising.
+- **`get_project_properties(project_key) -> dict[str, Any]`** — same pattern under
+  `/project/{key}/properties`.
+
+  Private helper `_fetch_properties(base_path)` backs all three property methods
+  (list-then-dereference; 404 on the list → `{}`, 404 on an individual value →
+  skip that key).
+
 ## [0.3.2] — 2026-06-03
 
 ### Fixed

@@ -14,6 +14,7 @@ import re
 from collections import deque
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, tzinfo
+from typing import Any
 
 import requests
 
@@ -57,6 +58,14 @@ def _is_http_400(exc: BaseException) -> bool:
         isinstance(exc, requests.HTTPError)
         and exc.response is not None
         and exc.response.status_code == 400
+    )
+
+
+def _is_http_404(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, requests.HTTPError)
+        and exc.response is not None
+        and exc.response.status_code == 404
     )
 
 
@@ -345,6 +354,152 @@ class JiraClient:
             ).json()
             or []
         )
+
+    def get_watchers(self, key: str) -> list[dict]:
+        """Watcher identity list via `/rest/api/2/issue/{key}/watchers`.
+
+        Returns the `watchers` array (full user objects: `name`, `key`,
+        `emailAddress`, `displayName`, `active`, `timeZone`). The watcher *count*
+        is already on the issue payload (`fields.watches.watchCount`); this
+        endpoint is the only way to get the identities, and only if the caller
+        has the "View Voters and Watchers" permission. Returns `[]` when the
+        sub-resource is absent (404), mirroring `get_remote_links`' absence
+        handling.
+        """
+        url = f"{self.base_url}/rest/api/2/issue/{key}/watchers"
+        try:
+            data = request_with_retry(self.session, "GET", url, timeout=30, max_attempts=3).json()
+        except requests.exceptions.HTTPError as exc:
+            if _is_http_404(exc):
+                return []
+            raise
+        return data.get("watchers") or []
+
+    def get_voters(self, key: str) -> list[dict]:
+        """Voter identity list via `/rest/api/2/issue/{key}/votes`.
+
+        Returns the `voters` array (user objects). As with watchers, the vote
+        *count* is on the issue payload (`fields.votes.votes`); the voter
+        identities require this endpoint and the "View Voters and Watchers"
+        permission. Returns `[]` when the sub-resource is absent (404).
+        """
+        url = f"{self.base_url}/rest/api/2/issue/{key}/votes"
+        try:
+            data = request_with_retry(self.session, "GET", url, timeout=30, max_attempts=3).json()
+        except requests.exceptions.HTTPError as exc:
+            if _is_http_404(exc):
+                return []
+            raise
+        return data.get("voters") or []
+
+    def get_user(
+        self,
+        *,
+        username: str | None = None,
+        key: str | None = None,
+        account_id: str | None = None,
+        expand: str | None = "groups,applicationRoles",
+    ) -> dict:
+        """Single user via `/rest/api/2/user`, resolved by the right param for the deployment.
+
+        JIRA **Server** identifies users by `username=` or `key=` (the opaque
+        `JIRAUSER#####` form); JIRA **Cloud** uses `accountId=`. Pass exactly one
+        of `username` / `key` / `account_id`. Returns the user object
+        (`name`, `key`, `emailAddress`, `active`, `timeZone`, `locale`,
+        `displayName`). `expand` defaults to `"groups,applicationRoles"` so the
+        nested `groups.items` / `applicationRoles.items` lists are populated —
+        without it Server returns those collections with `size` set but `items`
+        empty. Pass `expand=None` to skip the expansion.
+
+        Returns `{}` when the user does not exist (404).
+        """
+        params = {
+            k: v
+            for k, v in (
+                ("username", username),
+                ("key", key),
+                ("accountId", account_id),
+                ("expand", expand),
+            )
+            if v is not None
+        }
+        if not (username or key or account_id):
+            raise ValueError("get_user requires one of username, key, or account_id")
+        url = f"{self.base_url}/rest/api/2/user"
+        try:
+            return request_with_retry(
+                self.session, "GET", url, params=params, timeout=30, max_attempts=3
+            ).json()
+        except requests.exceptions.HTTPError as exc:
+            if _is_http_404(exc):
+                return {}
+            raise
+
+    def _fetch_properties(self, base_path: str) -> dict[str, Any]:
+        """List then dereference every entity property under `base_path`.
+
+        `GET {base_path}/properties` returns `{"keys": [{"key": ...}, ...]}`; each
+        property's value lives at `{base_path}/properties/{propertyKey}` as
+        `{"key": ..., "value": ...}`. (`?expand=properties` on the parent resource
+        returns null on JIRA Server, so the dedicated sub-resource is the only way
+        to read these.) Returns `{propertyKey: value}`. A 404 on the *list* — the
+        sub-resource isn't supported on this build, or the parent entity is gone —
+        yields `{}`; a 404 on an individual value (raced deletion) skips that key.
+        """
+        list_url = f"{self.base_url}{base_path}/properties"
+        try:
+            listing = request_with_retry(
+                self.session, "GET", list_url, timeout=30, max_attempts=3
+            ).json()
+        except requests.exceptions.HTTPError as exc:
+            if _is_http_404(exc):
+                return {}
+            raise
+        result: dict[str, Any] = {}
+        for entry in listing.get("keys") or []:
+            prop_key = entry.get("key")
+            if not prop_key:
+                continue
+            try:
+                value = request_with_retry(
+                    self.session,
+                    "GET",
+                    f"{list_url}/{prop_key}",
+                    timeout=30,
+                    max_attempts=3,
+                ).json()
+            except requests.exceptions.HTTPError as exc:
+                if _is_http_404(exc):
+                    continue
+                raise
+            result[prop_key] = value.get("value")
+        return result
+
+    def get_issue_properties(self, key: str) -> dict[str, Any]:
+        """All entity properties for an issue, as `{propertyKey: value}`.
+
+        Lists `/rest/api/2/issue/{key}/properties` then dereferences each value.
+        Returns `{}` when the issue has no properties or the parent is missing.
+        """
+        return self._fetch_properties(f"/rest/api/2/issue/{key}")
+
+    def get_comment_properties(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+        """All entity properties for a single comment, as `{propertyKey: value}`.
+
+        Lists `/rest/api/2/issue/{key}/comment/{id}/properties` then dereferences
+        each value. The comment-properties sub-resource is not exposed on every
+        JIRA Server build (some return 404 for it wholesale) — that, an empty
+        property set, and a missing comment all collapse to `{}`.
+        """
+        return self._fetch_properties(f"/rest/api/2/issue/{issue_key}/comment/{comment_id}")
+
+    def get_project_properties(self, project_key: str) -> dict[str, Any]:
+        """All entity properties for a project, as `{propertyKey: value}`.
+
+        Lists `/rest/api/2/project/{key}/properties` then dereferences each value.
+        Returns `{}` when the project has no properties or is missing.
+        """
+        return self._fetch_properties(f"/rest/api/2/project/{project_key}")
 
     def get_issue_resilient(self, key: str) -> ResilientFetchResult:
         """Three-tier resilient fetch.
