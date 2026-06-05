@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/uofm-matt/jira-resilient/test.yml?branch=main&label=tests)](https://github.com/uofm-matt/jira-resilient/actions/workflows/test.yml)
 
-In any large JIRA Server install, a handful of "hub" issues accumulate enormous numbers of `Implements` / `Tests` / `Relates` links — easily into the thousands. A real-world example: a single issue with **8,000+ issuelinks**. The standard `GET /issue/{key}?fields=*all` for that issue returns a ~10 MB payload that takes JIRA 3+ minutes to serialize — well past every existing Python client's default timeout. Result: the issue is silently absent from the warehouse, no error, no retry that would help.
+In any large JIRA Server install, a handful of "hub" issues accumulate enormous numbers of `Implements` / `Tests` / `Relates` links — easily into the thousands. A real-world example: a single issue with **many thousands of issuelinks**. The standard `GET /issue/{key}?fields=*all` for that issue returns a ~10 MB payload that takes JIRA 3+ minutes to serialize — well past every existing Python client's default timeout. Result: the issue is silently absent from the warehouse, no error, no retry that would help.
 
 This library exists to solve that. The fix is a three-tier fetch that recognizes the timeout pattern and recovers data via split requests:
 
@@ -15,7 +15,7 @@ This library exists to solve that. The fix is a three-tier fetch that recognizes
 result = client.get_issue_resilient("HUB-1234")
 # result.tier == "hub"    → fields=*all,-issuelinks fetched fast,
 #                          issuelinks fetched separately with a long timeout
-# result.issue            → fully assembled issue, all 8,000+ links intact
+# result.issue            → fully assembled issue, all the links intact
 ```
 
 Plus a few related reliability fixes the same code path needed along the way (seek-paginated `/search`, Lucene-reindex cursor handling, paginated changelog fallback, fail-fast-on-4xx in the retry loop). Documented further down.
@@ -43,7 +43,7 @@ if not client.is_authenticated:
 # THE killer feature — resilient single-issue fetch that survives hub issues.
 result = client.get_issue_resilient("HUB-1234")
 print(result.tier)         # "full" | "hub" | "minimal" — log this; minimal is lossy
-print(len(result.issue["fields"]["issuelinks"]))   # 8000+
+print(len(result.issue["fields"]["issuelinks"]))   # thousands
 
 # Seek-paginated scan — survives 100K+ issue projects.
 for page in client.search_seek("PROJ"):
@@ -80,16 +80,16 @@ Every JIRA Python client on PyPI today (`jira`, `atlassian-python-api`, `pycontr
 
 A "hub" issue in JIRA isn't a special type — it's any issue that ends up linked to a lot of other issues over its lifetime. Common patterns that produce them:
 
-- A **parent requirement** with `Implements` links to every child that satisfies it
-- An **integration test plan** that `Tests` every endpoint
-- A **decomposition anchor** that's `Decomposed-from` for an entire feature area
+- A **parent epic** with `Implements` links to every child that satisfies it
+- An **end-to-end test plan** that `Tests` every component it covers
+- A **shared platform ticket** that an entire feature area links back to
 - A **defect tracker** with `Relates` to every related ticket
 
-In a project with a few thousand issues, you might have 5–10 hub issues out of the lot. In a project with 150K issues — common in long-lived enterprise installs — you can have hundreds, with link counts climbing into the low thousands.
+In a project with a few thousand issues, you might have 5–10 hub issues out of the lot. In a project with 100K+ issues — common in long-lived enterprise installs — you can have hundreds, with link counts climbing into the low thousands.
 
 Three reasons existing clients can't handle this:
 
-1. **`fields=*all` returns everything inline.** A 7K-link issue is a ~10 MB JSON payload. JIRA's serializer is single-threaded per request and takes minutes; clients with a 60s or 120s timeout just see a `ReadTimeoutError`.
+1. **`fields=*all` returns everything inline.** A multi-thousand-link issue is a ~10 MB JSON payload. JIRA's serializer is single-threaded per request and takes minutes; clients with a 60s or 120s timeout just see a `ReadTimeoutError`.
 2. **There's no documented escape hatch.** JIRA Server has no "give me this issue but skip the slow fields" endpoint. You have to know to request `fields=*all,-issuelinks` and then fetch `issuelinks` separately with a longer timeout — and even then, the issuelinks-only request can take 3+ minutes for the largest hubs.
 3. **Retrying doesn't help.** Exponential backoff over the same broken request just wastes time. You need a fundamentally different fetch pattern, not more attempts.
 

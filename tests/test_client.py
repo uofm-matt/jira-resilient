@@ -142,7 +142,7 @@ def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
     issue in the minute regardless of after_key) used to spin forever. The deque-based
     cycle detector forces a minute-advance once a boundary repeats within the last N pages.
     """
-    ts = "2026-05-19T11:51:07.000-0400"
+    ts = "2026-05-19T11:51:07.000+0000"
     cycle_page = {
         "issues": [
             {"key": "XX-208847", "id": "208847", "fields": {"updated": ts}},
@@ -154,7 +154,7 @@ def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
     }
     after_page = {
         "issues": [
-            {"key": "XX-300", "id": "300", "fields": {"updated": "2026-05-19T11:53:00.000-0400"}}
+            {"key": "XX-300", "id": "300", "fields": {"updated": "2026-05-19T11:53:00.000+0000"}}
         ],
         "names": {},
         "schema": {},
@@ -958,9 +958,9 @@ def test_server_tz_uses_probed_offset(client, base_url):
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/serverInfo",
-        json={"serverTime": "2026-05-19T13:00:00.000-0400"},
+        json={"serverTime": "2026-05-19T13:00:00.000+0530"},
     )
-    assert client.server_tz.utcoffset(None) == timedelta(hours=-4)
+    assert client.server_tz.utcoffset(None) == timedelta(hours=5, minutes=30)
 
 
 # ----- watchers / voters --------------------------------------------------------

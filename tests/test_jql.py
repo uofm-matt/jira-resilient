@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -71,13 +70,14 @@ class TestBuildSeekJql:
         assert "42" not in out  # seconds stripped
 
     def test_tz_converts_aware_datetime_before_formatting(self):
-        # UTC cursor — but JIRA is in non-UTC, so the rendered JQL must be in ET.
-        # Without this conversion, JIRA Server interprets "2026-05-18 12:00" as 12:00 ET = 16:00 UTC,
-        # silently dropping all updates between 12:00 UTC and 16:00 UTC.
+        # UTC cursor against a server whose local TZ is UTC-4, so the rendered JQL
+        # must be in that offset. Without this conversion, JIRA Server interprets
+        # "2026-05-18 12:00" as 12:00 server-local = 16:00 UTC, silently dropping
+        # all updates between 12:00 UTC and 16:00 UTC.
         utc_ts = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
-        et = ZoneInfo("UTC")  # UTC in May = UTC-4
-        out = build_seek_jql("PROJ", after_ts=utc_ts, tz=et)
-        assert '"2026-05-18 08:00"' in out  # 12:00 UTC = 08:00 UTC
+        server_tz = timezone(timedelta(hours=-4))  # arbitrary UTC-4 example
+        out = build_seek_jql("PROJ", after_ts=utc_ts, tz=server_tz)
+        assert '"2026-05-18 08:00"' in out  # 12:00 UTC = 08:00 at UTC-4
 
     def test_tz_none_preserves_legacy_behavior(self):
         utc_ts = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
@@ -86,8 +86,6 @@ class TestBuildSeekJql:
 
     def test_tz_works_for_build_jql_too(self):
         utc_ts = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
-        et = timezone(
-            offset=datetime(2026, 5, 18).astimezone(ZoneInfo("UTC")).utcoffset()
-        )
-        out = build_jql("PROJ", updated_after=utc_ts, tz=et)
+        server_tz = timezone(timedelta(hours=-4))  # arbitrary UTC-4 example
+        out = build_jql("PROJ", updated_after=utc_ts, tz=server_tz)
         assert '"2026-05-18 08:00"' in out

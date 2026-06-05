@@ -2,6 +2,16 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.2] — 2026-06-04
+
+Documentation/packaging only — **no functional change** (API and behavior identical
+to 0.4.0/0.4.1).
+
+### Changed
+- Genericized remaining examples in the tests, docs, and changelog (timezone
+  fixtures, illustrative scale figures, and the hub-issue patterns) so the package
+  carries only neutral, example-agnostic detail.
+
 ## [0.4.1] — 2026-06-04
 
 Documentation + packaging only — **no functional change**; the API and behavior are
@@ -33,7 +43,7 @@ identical to 0.4.0.
 Six new single-entity read methods on `JiraClient`, each mirroring the existing
 `get_comments` / `get_worklogs` / `get_remote_links` style (retry-with-backoff,
 JIRA-Server REST endpoints, graceful absence handling). All endpoint shapes were
-verified live against a JIRA Server x.y.z instance before release.
+verified live against a JIRA Server instance before release.
 
 - **`get_watchers(key) -> list[dict]`** — `GET /rest/api/2/issue/{key}/watchers`,
   returns the `watchers` array (full user objects). The watcher *count* is already
@@ -55,7 +65,7 @@ verified live against a JIRA Server x.y.z instance before release.
 - **`get_comment_properties(issue_key, comment_id) -> dict[str, Any]`** — same
   pattern under `/issue/{key}/comment/{id}/properties`. Some JIRA Server builds
   do not expose this sub-resource at all (observed returning 404 wholesale on
-  some Service Desk projects) — that collapses to `{}` rather than raising.
+  some projects) — that collapses to `{}` rather than raising.
 - **`get_project_properties(project_key) -> dict[str, Any]`** — same pattern under
   `/project/{key}/properties`.
 
@@ -112,9 +122,9 @@ verified live against a JIRA Server x.y.z instance before release.
   id-scan logic lives in exactly one place; on detecting a reindex loop the delta
   path falls back to a full `id` scan. The `updated`-parse and stale-`after_key`
   guards are now delta-only (a full scan never reads `updated` or uses `after_key`).
-- Live-validated by a full nuke-and-reload of two large instances (hundreds of
-  thousands of issues), which reproduced live JIRA exactly per project with
-  **zero** reindex-recovery machinery firing — the full path scans purely by `id`.
+- Validated by a full re-load against a large project, which reproduced the live
+  source exactly with **zero** reindex-recovery machinery firing — the full path
+  scans purely by `id`.
 
 ## [0.2.2] — 2026-05-20
 
@@ -267,9 +277,9 @@ only callers using the kwargs need to switch to `get_issue_raw`.
 - **JQL timezone bug.** JIRA Server's JQL parser interprets bare `"YYYY-MM-DD HH:MM"`
   date strings in the JIRA server's local timezone, **not** UTC. `build_jql` and
   `build_seek_jql` previously formatted datetimes in their source TZ (typically UTC),
-  so JIRA Server silently shifted the filter by its local offset. For an
-  a non-UTC JIRA, every delta sync's filter was shifted ~4 hours forward —
-  effectively dropping every issue updated in the past 4 hours from each cron run.
+  so JIRA Server silently shifted the filter by its local offset. For a JIRA
+  whose server TZ is N hours behind UTC, every delta sync's filter was shifted
+  N hours forward — effectively dropping every recently-updated issue from each run.
 
 ### Added
 - `build_jql` and `build_seek_jql` gained a `tz: tzinfo | None` parameter. When set
