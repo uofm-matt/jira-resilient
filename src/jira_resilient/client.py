@@ -110,11 +110,15 @@ class JiraClient:
         verify: str | bool = True,
         timeout: int = 120,
         max_attempts: int = 5,
+        pool_maxsize: int = 10,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_attempts = max_attempts
-        self.session = make_session(pat, verify)
+        # pool_maxsize: raise above the default 10 when fanning concurrent requests through this
+        # client (a thread pool of N parallel GETs needs pool_maxsize >= N, else urllib3 caps live
+        # connections at 10 and churns the surplus — "Connection pool is full").
+        self.session = make_session(pat, verify, pool_maxsize=pool_maxsize)
         self._server_tz: tzinfo | None = None
         # JIRA Cloud / some DC builds expose a paginated /issue/{key}/changelog
         # sub-resource; JIRA Server returns 404 for it. Probe once, then cache so we

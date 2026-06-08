@@ -2,6 +2,15 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.4] — 2026-06-07
+
+### Added
+- **`pool_maxsize` on `JiraClient` and `make_session`** (default 10, urllib3's default — no
+  behavior change unless set). Sizes the per-host connection pool so a caller fanning N
+  concurrent requests through one client/session can raise it to N. Without this, urllib3
+  caps live connections at 10 and discards/reopens the surplus ("Connection pool is full"),
+  throttling a high-concurrency fan-out to 10 regardless of the thread-pool width.
+
 ## [0.4.3] — 2026-06-07
 
 First functional change since 0.4.0 — a focused retry-path fix.

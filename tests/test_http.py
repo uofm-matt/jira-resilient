@@ -38,6 +38,20 @@ def test_make_session_mounts_tls_adapter():
     assert https_adapter.max_retries is _RETRY
 
 
+def test_make_session_pool_maxsize_default_is_10():
+    sess = make_session(pat="x")
+    adapter = sess.get_adapter("https://example.com")
+    assert adapter.poolmanager.connection_pool_kw["maxsize"] == 10
+
+
+def test_make_session_pool_maxsize_sizes_the_pool():
+    """A caller fanning N concurrent requests through one session must be able to size the
+    per-host pool to N — else urllib3 caps live connections at 10 and churns the surplus."""
+    sess = make_session(pat="x", pool_maxsize=48)
+    adapter = sess.get_adapter("https://example.com")
+    assert adapter.poolmanager.connection_pool_kw["maxsize"] == 48
+
+
 @responses.activate
 def test_request_with_retry_succeeds_first_try():
     responses.add(responses.GET, "https://x/foo", json={"ok": True}, status=200)
