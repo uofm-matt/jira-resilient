@@ -2,6 +2,20 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.3] — 2026-06-07
+
+First functional change since 0.4.0 — a focused retry-path fix.
+
+### Fixed
+- **429 rate-limit handling now honors `Retry-After`.** `request_with_retry` is the single
+  authority for 429: it reads the `Retry-After` header (delta-seconds or HTTP-date) and
+  sleeps for exactly that, falling back to the exponential schedule only when the header is
+  absent, and capping any single sleep at 960s so a hostile or buggy header can't park a
+  worker indefinitely. The connection-level retry no longer silently retries 429 (429 is
+  dropped from its Retry-After status set), removing a layered double-retry; 413 and 503
+  stay urllib3-handled. Previously the application-level 429 path always slept the blind
+  `60 * 2**attempt` schedule, contrary to the documented behavior.
+
 ## [0.4.2] — 2026-06-04
 
 Documentation/packaging only — **no functional change** (API and behavior identical
