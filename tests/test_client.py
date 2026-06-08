@@ -17,6 +17,13 @@ def client(base_url):
     return JiraClient(base_url, pat="test", verify=False)
 
 
+def test_pool_maxsize_threads_through_to_session(base_url):
+    """pool_maxsize reaches the session's per-host pool, so concurrent callers can size it."""
+    c = JiraClient(base_url, pat="test", verify=False, pool_maxsize=32)
+    adapter = c.session.get_adapter("https://example.com")
+    assert adapter.poolmanager.connection_pool_kw["maxsize"] == 32
+
+
 @responses.activate
 def test_is_authenticated_ok(client, base_url):
     responses.add(

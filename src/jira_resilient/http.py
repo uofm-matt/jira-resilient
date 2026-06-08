@@ -77,13 +77,22 @@ def _retry_after_seconds(resp: requests.Response) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
-def make_session(pat: str | None, verify: str | bool = True) -> requests.Session:
-    """Build a `requests.Session` configured for JIRA Server PAT auth + TLS 1.2+."""
+def make_session(
+    pat: str | None, verify: str | bool = True, pool_maxsize: int = 10
+) -> requests.Session:
+    """Build a `requests.Session` configured for JIRA Server PAT auth + TLS 1.2+.
+
+    pool_maxsize sizes the per-host connection pool. The default (10, urllib3's default)
+    is fine for serial use; raise it to the number of concurrent requests you fan out
+    through this session (e.g. a thread pool issuing N parallel GETs) — otherwise urllib3
+    caps live connections at 10 and discards/reopens the surplus ("Connection pool is full")."""
     session = requests.Session()
     if pat:
         session.headers["Authorization"] = f"Bearer {pat}"
     session.verify = verify
-    adapter = _TLSAdapter(max_retries=_RETRY)
+    adapter = _TLSAdapter(
+        max_retries=_RETRY, pool_connections=pool_maxsize, pool_maxsize=pool_maxsize
+    )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
