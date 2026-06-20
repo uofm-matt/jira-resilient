@@ -27,7 +27,7 @@ from jira_resilient.exceptions import (
     JiraParseError,
     JiraResilientError,
 )
-from jira_resilient.jql import build_jql, build_seek_jql
+from jira_resilient.jql import build_jql
 
 __version__ = "0.4.4"
 
@@ -42,5 +42,4 @@ __all__ = [
     "Tier",
     "__version__",
     "build_jql",
-    "build_seek_jql",
 ]

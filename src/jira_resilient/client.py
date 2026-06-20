@@ -10,18 +10,16 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import re
-from collections import deque
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta, tzinfo
-from typing import Any
+from datetime import UTC, datetime, tzinfo
+from typing import Any, TypeGuard
 
 import requests
 
 from jira_resilient._models import ResilientFetchResult, SearchPage, Tier
 from jira_resilient.exceptions import JiraFetchError, JiraJqlError, JiraParseError
 from jira_resilient.http import make_session, request_with_retry
-from jira_resilient.jql import build_seek_jql
+from jira_resilient.jql import build_delta_minute_jql, build_next_minute_jql
 
 logger = logging.getLogger(__name__)
 
@@ -29,31 +27,8 @@ _LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for man
 _SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
 _SEARCH_PAGED_PAGE_SIZE = 50  # fields=*all without seek — older offset-paginated path
 
-# Consecutive reindex-loop signals before _search_by_updated bails to an id scan.
-_STALE_CYCLE_LIMIT = 3  # repeated page boundaries (minute-bump not escaping)
-_STALE_DUP_LIMIT = 3  # all-duplicate pages (boundary never repeats in the deque)
 
-# JIRA Server returns three distinct 400-error patterns when JQL `key > "X"`
-# references a key the server can't compare against. ALL of them wedge a seek
-# loop the same way (every subsequent cycle 400s forever until the cursor key
-# is cleared), so all three trigger the same auto-recovery: drop after_key,
-# retry. Two were observed in production (a deleted key and a reprojected key);
-# the malformed-key variant was added defensively.
-_STALE_KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Issue was deleted (or never existed).
-    re.compile(r"An issue with key '([^']+)' does not exist for field 'key'"),
-    # Issue was moved/reprojected to another project.
-    re.compile(r"Operator '[^']+' cannot be applied to moved issue key '([^']+)'"),
-    # Cursor data corrupted: not a valid issue-key shape (no dash, etc.).
-    re.compile(r"The issue key '([^']*)' for field 'key' is invalid"),
-)
-
-
-def _is_stale_after_key_error(error_messages: list[str]) -> bool:
-    return any(p.search(m) for m in error_messages for p in _STALE_KEY_PATTERNS)
-
-
-def _is_http_400(exc: BaseException) -> bool:
+def _is_http_400(exc: BaseException) -> TypeGuard[requests.HTTPError]:
     return (
         isinstance(exc, requests.HTTPError)
         and exc.response is not None
@@ -61,7 +36,7 @@ def _is_http_400(exc: BaseException) -> bool:
     )
 
 
-def _is_http_404(exc: BaseException) -> bool:
+def _is_http_404(exc: BaseException) -> TypeGuard[requests.HTTPError]:
     return (
         isinstance(exc, requests.HTTPError)
         and exc.response is not None
@@ -146,8 +121,8 @@ class JiraClient:
         """JIRA server's local timezone, probed once from `/rest/api/2/serverInfo`.
 
         JQL date literals like `"2026-05-19 13:00"` are parsed in *this* timezone, not
-        UTC. Pass to `build_jql`/`build_seek_jql` so a tz-aware cursor is rendered in
-        the timezone JIRA expects. `search_seek` does this automatically.
+        UTC. Pass to `build_jql` so a tz-aware cursor is rendered in the timezone JIRA
+        expects. `search_seek` does this automatically.
 
         Falls back to UTC if `serverTime` can't be parsed — at worst that's the same
         broken behavior callers had pre-fix.
@@ -621,17 +596,25 @@ class JiraClient:
           and lexical-vs-numeric key pitfalls an `updated` cursor must work
           around. It cannot loop, so it needs none of that machinery.
 
-        - **Delta** (`after_ts` set): page by the `(updated, key)` cursor for
-          issues changed since `after_ts` (`_search_by_updated`). That is the
-          only ordering that expresses "changed since X", and it carries the
-          reindex-recovery machinery because a server-side reindex makes the
-          `updated` cursor unreliable; on detecting a reindex loop it falls back
-          to a full `id` scan.
+        - **Delta** (`after_ts` set): page issues changed since `after_ts` one
+          `updated` minute at a time, draining each minute by `id`
+          (`_search_by_updated`). Both the within-minute filter and sort are on
+          `id`, so the cursor is monotonic and self-consistent — it cannot skip a
+          row or loop, even across a digit-width key boundary or a same-minute
+          cluster larger than a page.
+
+        `after_key`: **Deprecated and ignored since 0.5.0.** The delta cursor is
+        now `(updated, id)` and its within-minute tiebreaker is derived from issue
+        `id` internally, so no caller-supplied key is needed. Resumption across
+        calls relies on `after_ts` plus the caller's overlap buffer and idempotent
+        upserts. Accepted for backward compatibility; will be removed in a future
+        release.
 
         Every request uses `startAt=0`, so per-request cost stays bounded
         regardless of project size — JIRA Server's offset-pagination quadratic
         cost is sidestepped in both modes.
         """
+        del after_key  # deprecated no-op; see docstring
         if after_ts is None:
             yield from self._search_by_id(
                 project_key, extra_filter=extra_filter, page_size=page_size
@@ -640,7 +623,6 @@ class JiraClient:
             yield from self._search_by_updated(
                 project_key,
                 after_ts=after_ts,
-                after_key=after_key,
                 extra_filter=extra_filter,
                 page_size=page_size,
             )
@@ -688,131 +670,115 @@ class JiraClient:
         project_key: str,
         *,
         after_ts: datetime,
-        after_key: str | None,
         extra_filter: str | None,
         page_size: int,
     ) -> Iterator[SearchPage]:
-        """Delta scan by the `(updated, key)` cursor — issues changed since `after_ts`.
+        """Delta scan: issues changed since `after_ts`, one `updated` minute at a time.
 
-        Handles two JIRA Server quirks the `updated` cursor runs into:
+        A bare minute date literal is the instant `MM:00` to JIRA, and `ORDER BY
+        updated` is second-precision, so a single `(updated, key)` tuple-cursor query
+        silently skips a row updated later in a minute than the page boundary but with
+        a smaller key/id. The fix is to never paginate across a minute on `updated`:
 
-        1. **JQL minute-precision**: `updated > "10:59"` matches from 10:59:00.001
-           on, so a same-minute cluster larger than one page can re-serve the same
-           boundary row forever. A repeated boundary (tracked in a deque to catch
-           multi-page cycles) triggers a one-minute bump of `after_ts`.
+        1. **Drain** the cursor minute with the half-open range
+           `updated >= "MM" AND updated < "MM+1" AND id > after_id` ordered by `id`.
+           The range captures the whole minute (a bare `= "MM"` would match only the
+           `:00`-second rows); within it, filter and sort are both numeric `id`, so a
+           same-minute cluster of any size pages cleanly, one id-ascending page at a
+           time, with no skip and no looping (keys are never compared).
+        2. **Advance** to the next minute that has changes via a cheap one-row probe
+           (`_probe_next_minute`, `updated >= "MM+1"`), then drain that.
 
-        2. **Lucene-reindex divergence**: after a reindex, `fields.updated` lags the
-           index, so `updated >= X` matches everything regardless of X — an infinite
-           loop. Two detectors catch it — `stale_cycles` for the repeating-boundary
-           manifestation, a seen-key set for the yielded-duplicate manifestation —
-           and either switches to a full `id` scan via `_search_by_id`, which
-           terminates regardless of indexed timestamps.
-
-        Self-heals from a stale `after_key` (deleted/moved/malformed between cycles)
-        by dropping the tiebreaker when JIRA 400s on it.
+        Because `id` and the minute both advance monotonically, the scan terminates
+        with no cycle/duplicate detection. The one residual hazard is a Lucene
+        reindex, after which `fields.updated` can lag the index: the advance probe
+        then returns a row whose `updated` is not actually past the cursor minute.
+        That single signal triggers a fallback to a full `id` scan (`_search_by_id`,
+        `fallback=True`), which is divergence-immune because it never reads `updated`.
         """
-        recent_boundaries: deque[tuple[datetime, str]] = deque(maxlen=10)
-        stale_cycles = 0
-        consecutive_dup_pages = 0
-        seen_keys: set[str] = set()
+        if after_ts.tzinfo is None:
+            after_ts = after_ts.replace(tzinfo=UTC)
+        minute = after_ts.replace(second=0, microsecond=0)
+        after_id: int | None = None
         while True:
-            jql = build_seek_jql(
+            jql = build_delta_minute_jql(
                 project_key,
-                after_ts=after_ts,
-                after_key=after_key,
+                minute=minute,
+                after_id=after_id,
                 extra_filter=extra_filter,
                 tz=self.server_tz,
             )
-            try:
-                data, tier = self._search_one_page(jql, page_size)
-            except JiraJqlError as exc:
-                # Auto-recover from any "after_key references a key JIRA can't
-                # compare against" error (deleted, moved, or malformed key).
-                if after_key and _is_stale_after_key_error(exc.error_messages):
-                    logger.warning(
-                        "seek tiebreaker after_key=%s rejected by JIRA (%s); "
-                        "clearing and retrying without it",
-                        after_key,
-                        exc.error_messages[0] if exc.error_messages else "?",
-                    )
-                    after_key = None
-                    continue
-                raise
+            data, tier = self._search_one_page(jql, page_size)
             issues = data.get("issues") or []
-            names = data.get("names") or {}
-            schema = data.get("schema") or {}
-            if not issues:
-                break
+            if issues:
+                yield SearchPage(
+                    issues, data.get("names") or {}, data.get("schema") or {}, tier=tier
+                )
+                try:
+                    after_id = int(issues[-1]["id"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise JiraParseError(
+                        f"Delta page ended with row missing/invalid id: {issues[-1]!r}"
+                    ) from exc
+                if len(issues) >= page_size:
+                    continue  # same minute, more ids to drain
+            # Minute drained (empty or short page). Find the next minute with changes.
+            nxt = self._probe_next_minute(
+                project_key, after_minute=minute, extra_filter=extra_filter
+            )
+            if nxt is None:
+                return
+            if nxt <= minute:
+                # The probe matched `updated > minute` yet returned a row whose
+                # `updated` is not past it: fields.updated lags the index, i.e. a
+                # reindex. Fall back to an id scan, which ignores `updated` entirely.
+                logger.warning(
+                    "seek project=%s: next-minute probe returned %s <= cursor %s "
+                    "(fields.updated lags index) — reindex detected; switching to id scan",
+                    project_key,
+                    nxt,
+                    minute,
+                )
+                yield from self._search_by_id(
+                    project_key, extra_filter=extra_filter, page_size=page_size, fallback=True
+                )
+                return
+            minute, after_id = nxt, None
 
-            last = issues[-1]
-            last_updated = (last.get("fields") or {}).get("updated")
-            last_key = last.get("key")
-            try:
-                new_ts = datetime.fromisoformat(last_updated) if last_updated else None
-            except (AttributeError, ValueError) as exc:
-                raise JiraParseError(
-                    f"Could not parse `updated` timestamp from JIRA: {last_updated!r}"
-                ) from exc
-            if new_ts is None or last_key is None:
-                raise JiraParseError(f"Page ended with row missing updated/key: {last!r}")
+    def _probe_next_minute(
+        self, project_key: str, *, after_minute: datetime, extra_filter: str | None
+    ) -> datetime | None:
+        """Floored `updated` minute of the first issue changed after `after_minute`.
 
-            current_boundary = (new_ts, last_key)
-            if current_boundary in recent_boundaries:
-                # Repeated boundary: a minute-precision cluster, or a reindex loop.
-                # Bump past the current minute and drop the tiebreaker.
-                bumped = (after_ts + timedelta(minutes=1)).replace(second=0, microsecond=0)
-                # If fields.updated is still behind the bumped minute, the bump isn't
-                # escaping — Lucene has diverged from fields.updated (post-reindex).
-                stale_cycles = stale_cycles + 1 if new_ts < bumped else 0
-                if stale_cycles >= _STALE_CYCLE_LIMIT:
-                    logger.warning(
-                        "seek project=%s: %d consecutive stale minute-bumps "
-                        "(fields.updated=%s < after_ts=%s) — reindex detected; "
-                        "switching to id-ordered scan",
-                        project_key,
-                        stale_cycles,
-                        new_ts,
-                        after_ts,
-                    )
-                    yield from self._search_by_id(
-                        project_key, extra_filter=extra_filter, page_size=page_size, fallback=True
-                    )
-                    return
-                after_ts = bumped
-                after_key = None
-                recent_boundaries.clear()
-                continue
-
-            yield SearchPage(issues, names, schema, tier=tier)
-            recent_boundaries.append(current_boundary)
-            # after_key always advances to the last row; after_ts is the conditional
-            # part. Monotonic floor — advance after_ts to max(prev, new). Guard: when a
-            # full page's fields.updated is far ahead of the JQL minute (bulk transition
-            # then later edits), hold after_ts and advance by key only, to exhaust the
-            # cluster before jumping so remaining cluster issues aren't abandoned.
-            after_key = last_key
-            if len(issues) < page_size or new_ts <= after_ts + timedelta(minutes=2):
-                after_ts = max(after_ts, new_ts)
-            # A reindex loop that never repeats a boundary instead re-yields seen keys:
-            # a healthy page always contributes at least one key we haven't seen.
-            page_keys = {k for issue in issues if (k := issue.get("key"))}
-            if page_keys - seen_keys:
-                consecutive_dup_pages = 0
-            else:
-                consecutive_dup_pages += 1
-                if consecutive_dup_pages >= _STALE_DUP_LIMIT:
-                    logger.warning(
-                        "seek project=%s: %d consecutive all-duplicate pages "
-                        "(last_key=%s) — reindex detected; switching to id-ordered scan",
-                        project_key,
-                        consecutive_dup_pages,
-                        last_key,
-                    )
-                    yield from self._search_by_id(
-                        project_key, extra_filter=extra_filter, page_size=page_size, fallback=True
-                    )
-                    return
-            seen_keys |= page_keys
+        A one-row, `updated`-only `/search` — the cheap advance step of the delta
+        drain. Returns `None` when nothing remains. Raises `JiraJqlError` on a 400
+        (e.g. a malformed `extra_filter`); `JiraParseError` if the row lacks `updated`.
+        """
+        jql = build_next_minute_jql(
+            project_key, after_minute=after_minute, extra_filter=extra_filter, tz=self.server_tz
+        )
+        url = f"{self.base_url}/rest/api/2/search"
+        body = {"jql": jql, "startAt": 0, "maxResults": 1, "fields": ["updated"]}
+        try:
+            data = request_with_retry(
+                self.session, "POST", url, json=body, timeout=60, max_attempts=2
+            ).json()
+        except requests.RequestException as exc:
+            if _is_http_400(exc):
+                raise _jql_error_from(exc, jql) from exc
+            raise JiraFetchError(f"next-minute probe failed for jql={jql!r}: {exc!r}") from exc
+        issues = data.get("issues") or []
+        if not issues:
+            return None
+        updated = (issues[0].get("fields") or {}).get("updated")
+        if not isinstance(updated, str):
+            raise JiraParseError(f"next-minute probe row missing `updated`: {issues[0]!r}")
+        try:
+            return datetime.fromisoformat(updated).replace(second=0, microsecond=0)
+        except ValueError as exc:
+            raise JiraParseError(
+                f"next-minute probe row has unparseable `updated`={updated!r}"
+            ) from exc
 
     def _search_one_page(self, jql: str, page_size: int, *, start_at: int = 0) -> tuple[dict, Tier]:
         """Three-tier `/search` request mirroring `get_issue_resilient`'s shape.

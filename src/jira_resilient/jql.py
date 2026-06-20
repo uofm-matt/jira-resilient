@@ -7,7 +7,7 @@ the JiraClient class so callers can compose JQL outside of any request flow.
 from __future__ import annotations
 
 import re
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 
 # JIRA project keys: ASCII letter followed by 1-19 alphanumeric/underscore chars.
 _SAFE_PROJECT_KEY = re.compile(r"^[A-Z][A-Z0-9_]{1,19}$")
@@ -78,42 +78,79 @@ def _fmt_jql_ts(ts: str | datetime, tz: tzinfo | None) -> str:
     return str(ts).replace("T", " ")[:16]
 
 
-def build_seek_jql(
+# The delta scan is built from two minute-scoped primitives rather than one
+# `(updated, key)` JQL. JQL's `updated` *sort* is second-precision, but a bare minute
+# date LITERAL is the INSTANT `MM:00` for every operator (verified on JIRA Server DC:
+# `updated = "11:17"` matches only rows at exactly 11:17:00, not the whole minute). So
+# the drain pins a minute with the half-open RANGE `updated >= "MM" AND updated < "MM+1"`
+# (correct under either reading of `=`), and seeks within it on numeric `id` where the
+# filter and sort agree exactly. Soundness lives in the drain-then-advance protocol
+# (`JiraClient._search_by_updated`), not in any single JQL string — so these builders are
+# deliberately NOT in `__all__`.
+
+
+def build_delta_minute_jql(
     project_key: str,
     *,
-    after_ts: datetime | str | None = None,
-    after_key: str | None = None,
+    minute: datetime,
+    after_id: int | None = None,
     extra_filter: str | None = None,
     tz: tzinfo | None = None,
 ) -> str:
-    """Build a seek-pagination JQL using the `(updated, key)` tuple cursor.
+    """JQL that pages one `updated` minute by issue `id` — the delta drain step.
 
-    JIRA Server JQL has no native tuple comparison, so we rewrite the cursor as
-    `(updated > X) OR (updated = X AND key > Y)` — strictly past the boundary
-    OR tied on `updated` with a key past the tiebreaker.
+    Bounds `updated` to one minute with the half-open range `>= "MM" AND < "MM+1"`
+    (NOT `= "MM"`: JIRA reads a bare minute literal as the instant `MM:00`, so `=`
+    would match only the `:00`-second rows). Within the minute the cursor is issue
+    `id`, so the filter (`id > N`, numeric) and the sort (`ORDER BY id ASC`, numeric)
+    agree exactly — a same-minute cluster of any size drains cleanly, one id-ascending
+    page at a time, immune to the minute-precision / lexical-vs-numeric pitfalls a
+    `(updated, key)` cursor hits.
 
-    JQL date literals only accept minute precision; ties at the minute boundary
-    are handled by the `key > after_key` tiebreaker and idempotent upserts
-    downstream. See `JiraClient.search_seek` for the runtime handling.
-
-    JIRA Server interprets bare `"YYYY-MM-DD HH:MM"` JQL dates in its own local
-    timezone, not UTC. Pass `tz` (typically from `JiraClient.server_tz`) so a
-    tz-aware `after_ts` is converted before formatting.
+    `minute` is rendered at minute precision (seconds dropped). Pass `tz`
+    (typically `JiraClient.server_tz`) so a tz-aware `minute` is converted to the
+    timezone JIRA Server parses bare JQL dates in.
 
     >>> from datetime import datetime, timezone
-    >>> ts = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
-    >>> build_seek_jql("PROJ", after_ts=ts, after_key="PROJ-100")
-    'project = "PROJ" AND (updated > "2026-05-18 07:30" OR (updated = "2026-05-18 07:30" AND key > "PROJ-100")) ORDER BY updated ASC, key ASC'
+    >>> m = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
+    >>> build_delta_minute_jql("PROJ", minute=m, after_id=10042)
+    'project = "PROJ" AND updated >= "2026-05-18 07:30" AND updated < "2026-05-18 07:31" AND id > 10042 ORDER BY id ASC'
     """
     _check_project_key(project_key)
-    base = f'project = "{project_key}"'
-    if after_ts:
-        ts = _fmt_jql_ts(after_ts, tz)
-        if after_key:
-            base += f' AND (updated > "{ts}" OR (updated = "{ts}" AND key > "{after_key}"))'
-        else:
-            base += f' AND updated >= "{ts}"'
+    lo = _fmt_jql_ts(minute, tz)
+    hi = _fmt_jql_ts(minute + timedelta(minutes=1), tz)
+    clauses = [f'project = "{project_key}"', f'updated >= "{lo}"', f'updated < "{hi}"']
+    if after_id is not None:
+        clauses.append(f"id > {int(after_id)}")
     if extra_filter:
         _check_extra_filter(extra_filter)
-        base += f" AND {extra_filter}"
-    return base + " ORDER BY updated ASC, key ASC"
+        clauses.append(f"({extra_filter})")
+    return " AND ".join(clauses) + " ORDER BY id ASC"
+
+
+def build_next_minute_jql(
+    project_key: str,
+    *,
+    after_minute: datetime,
+    extra_filter: str | None = None,
+    tz: tzinfo | None = None,
+) -> str:
+    """JQL probing for the first issue in a minute after `after_minute`.
+
+    Advance step: once minute MM is fully drained, the next change is at or after the
+    NEXT minute, so this filters `updated >= "MM+1"`. (Not `updated > "MM"`: JIRA reads
+    that as `> MM:00`, which would re-include MM's own `:01`-`:59` rows.) The caller
+    reads only the first row's `updated`.
+
+    >>> from datetime import datetime, timezone
+    >>> m = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
+    >>> build_next_minute_jql("PROJ", after_minute=m)
+    'project = "PROJ" AND updated >= "2026-05-18 07:31" ORDER BY updated ASC, id ASC'
+    """
+    _check_project_key(project_key)
+    ts = _fmt_jql_ts(after_minute + timedelta(minutes=1), tz)
+    clauses = [f'project = "{project_key}"', f'updated >= "{ts}"']
+    if extra_filter:
+        _check_extra_filter(extra_filter)
+        clauses.append(f"({extra_filter})")
+    return " AND ".join(clauses) + " ORDER BY updated ASC, id ASC"

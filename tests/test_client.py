@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import UTC
+import json
+import operator
+import re
+from datetime import UTC, datetime
 
 import pytest
 import requests
@@ -10,6 +13,54 @@ import responses
 
 from jira_resilient import JiraClient, JiraFetchError, JiraParseError
 from jira_resilient.exceptions import JiraJqlError
+
+
+def _fake_jira_delta_search(base_url, dataset, *, calls=None):
+    """Register a `responses` callback that faithfully models JIRA Server's delta
+    `/search` semantics, so a test can assert the client retrieves every issue.
+
+    Models the REAL semantics: a bare minute literal `"YYYY-MM-DD HH:MM"` is the INSTANT
+    `MM:00` for every operator (verified live on JIRA Server DC). The delta scan emits the
+    half-open drain `updated >= "MM" AND updated < "MM+1" [AND id > N] ORDER BY id ASC` and
+    the advance probe `updated >= "MM+1" ... ORDER BY updated ASC, id ASC` (maxResults 1).
+    `calls`, if a list, collects each JQL for loop-bound assertions.
+    """
+    rows = [(int(d["id"]), d["key"], datetime.fromisoformat(d["updated"])) for d in dataset]
+
+    def _instant(lit: str) -> datetime:  # "2026-05-18 10:01" -> aware instant 10:01:00
+        return datetime.fromisoformat(lit + ":00").replace(tzinfo=UTC)
+
+    def _callback(request):
+        body = json.loads(request.body)
+        jql, max_results = body["jql"], body["maxResults"]
+        if calls is not None:
+            calls.append(jql)
+        ops = {
+            ">=": operator.ge,
+            "<": operator.lt,
+            "<=": operator.le,
+            ">": operator.gt,
+            "=": operator.eq,
+        }
+        hits = list(rows)
+        for op, lit in re.findall(r'updated (>=|<=|<|>|=) "([\d-]{10} [\d:]{5})"', jql):
+            t = _instant(lit)
+            hits = [r for r in hits if ops[op](r[2], t)]
+        if g := re.search(r"id > (\d+)", jql):
+            hits = [r for r in hits if r[0] > int(g.group(1))]
+        hits.sort(key=(lambda r: r[0]) if "ORDER BY id ASC" in jql else (lambda r: (r[2], r[0])))
+        issues = [
+            {"id": str(i), "key": k, "fields": {"updated": u.isoformat()}}
+            for i, k, u in hits[:max_results]
+        ]
+        return (200, {}, json.dumps({"issues": issues, "names": {}, "schema": {}}))
+
+    responses.add_callback(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        callback=_callback,
+        content_type="application/json",
+    )
 
 
 @pytest.fixture
@@ -144,154 +195,126 @@ def test_search_seek_yields_pages(client, base_url):
 
 
 @responses.activate
-def test_search_seek_breaks_n_cycle_inside_same_minute(client, base_url):
-    """Regression: a 3-page cycle within one minute (JQL minute-precision matching every
-    issue in the minute regardless of after_key) used to spin forever. The deque-based
-    cycle detector forces a minute-advance once a boundary repeats within the last N pages.
+def test_search_seek_delta_drains_same_minute_cluster_by_id(client, base_url):
+    """A same-minute cluster larger than a page must drain fully by id — the case the
+    old lexical `key >` cursor silently truncated. Keys here are deliberately
+    lexical-misordered vs numeric (`PROJ-2` > `PROJ-10` as strings) and span a
+    digit-width boundary (2..30); the id-ordered drain is immune to all of it.
     """
-    ts = "2026-05-19T11:51:07.000+0000"
-    cycle_page = {
-        "issues": [
-            {"key": "XX-208847", "id": "208847", "fields": {"updated": ts}},
-            {"key": "XX-209026", "id": "209026", "fields": {"updated": ts}},
-            {"key": "XX-209073", "id": "209073", "fields": {"updated": ts}},
-        ],
-        "names": {},
-        "schema": {},
-    }
-    after_page = {
-        "issues": [
-            {"key": "XX-300", "id": "300", "fields": {"updated": "2026-05-19T11:53:00.000+0000"}}
-        ],
-        "names": {},
-        "schema": {},
-    }
-    empty_page = {"issues": [], "names": {}, "schema": {}}
-    # Same page returned 15 times — would loop forever pre-fix. After the deque trips,
-    # post-fix the loop advances a minute, JIRA returns `after_page`, then empty → done.
-    for _ in range(15):
-        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=cycle_page)
-    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=after_page)
-    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=empty_page)
-
-    from datetime import datetime
+    client._server_tz = UTC
+    ts = "2026-05-18T10:00:00.000+0000"
+    dataset = [{"id": str(n), "key": f"PROJ-{n}", "updated": ts} for n in range(2, 31)]
+    _fake_jira_delta_search(base_url, dataset)
 
     pages = list(
-        client.search_seek(
-            "XX",
-            after_ts=datetime.fromisoformat("2026-05-19T11:51:00+00:00"),
-            after_key="XX-200000",
-        )
-    )
-    # Pre-fix: spins forever → test times out. Post-fix: a bounded number of pages.
-    assert any(p.issues[0]["key"] == "XX-300" for p in pages), (
-        "should advance past the cycling minute to reach XX-300"
+        client.search_seek("PROJ", after_ts=datetime(2026, 5, 18, 10, 0, tzinfo=UTC), page_size=10)
     )
 
+    got = [i["key"] for p in pages for i in p.issues]
+    assert sorted(got) == sorted(d["key"] for d in dataset)  # all 29, none skipped
+    assert len(got) == len(set(got)) == 29
+
 
 @responses.activate
-def test_search_seek_post_reindex_falls_back_to_key_only(client, base_url):
-    """Regression: after a JIRA server-side reindex, all project issues are re-indexed
-    at the reindex timestamp but fields.updated still shows original (older) values.
-    The seek JQL `updated >= "X"` matches everything regardless of X, so minute-bumping
-    never advances new_ts past after_ts — stale cycle detection fires after 3 consecutive
-    stale minute-advances and switches to key-only pagination, which terminates by
-    exhausting all keys.
+def test_search_seek_delta_no_skip_across_minute_boundary(client, base_url):
+    """Regression for the minute-truncation skip a `(updated, id)` tuple cursor still has:
+    a row updated later in a minute but with a SMALLER id than the page boundary sorts
+    past the boundary yet fails `id > boundary`, so a naive tuple cursor drops it.
+    Draining each minute fully by id before advancing keeps it.
     """
-    from datetime import datetime
+    client._server_tz = UTC
+    dataset = [
+        {"id": "100", "key": "PROJ-100", "updated": "2026-05-18T10:00:00.000+0000"},
+        {"id": "200", "key": "PROJ-200", "updated": "2026-05-18T10:01:30.000+0000"},
+        # later second (10:01:45) but smaller id than PROJ-200 — the trap row.
+        {"id": "150", "key": "PROJ-150", "updated": "2026-05-18T10:01:45.000+0000"},
+    ]
+    _fake_jira_delta_search(base_url, dataset)
 
-    # after_ts is in 2026; all cluster issues have original updated_at from 2024
-    after_ts = datetime(2026, 5, 19, 11, 51, tzinfo=UTC)
-    ts_old = "2024-07-14T19:37:16.000+0000"  # original, always behind after_ts
+    pages = list(
+        client.search_seek("PROJ", after_ts=datetime(2026, 5, 18, 10, 0, tzinfo=UTC), page_size=2)
+    )
 
-    # JIRA returns the same 2-issue page regardless of updated >= "X" filter
-    # (Lucene sees them as recently indexed; fields.updated is unchanged/old).
-    stale_page = {
-        "issues": [
-            {"key": "OPS-1", "id": "1", "fields": {"updated": ts_old}},
-            {"key": "OPS-2", "id": "2", "fields": {"updated": ts_old}},
-        ],
-        "names": {},
-        "schema": {},
-    }
-    # After switching to key-only, JIRA returns a later page by key
-    key_only_page = {
-        "issues": [{"key": "OPS-99", "id": "99", "fields": {"updated": ts_old}}],
-        "names": {},
-        "schema": {},
-    }
-    empty_page = {"issues": [], "names": {}, "schema": {}}
-
-    # Stale-cycle pattern: each cycle is 2 pages (page N, then repeat detected on page N+1).
-    # 3 cycles x 2 pages = 6 stale pages before the key-only switch fires.
-    # Add a few extra to simulate the pre-switch pages being yielded each cycle.
-    for _ in range(20):
-        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=stale_page)
-    # Key-only response (the fallback scan)
-    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=key_only_page)
-    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=empty_page)
-
-    pages = list(client.search_seek("OPS", after_ts=after_ts, page_size=2))
-
-    # Should terminate in a bounded number of pages, not consume all 20 stale mocks.
-    all_keys = [i["key"] for p in pages for i in p.issues]
-    assert "OPS-99" in all_keys, "should reach the key-only fallback page with OPS-99"
-    # Stale pages are yielded during the detection window; key-only page is also included.
-    assert len(pages) < 20, f"should terminate well before 20 pages, got {len(pages)}"
+    got = {i["key"] for p in pages for i in p.issues}
+    assert got == {"PROJ-100", "PROJ-200", "PROJ-150"}  # the trap row is not skipped
 
 
 @responses.activate
-def test_search_seek_post_reindex_long_cycle_falls_back_to_key_only(client, base_url):
-    """Long-cycle Lucene-reindex regression: cycle length (12 pages) exceeds the
-    deque window (maxlen=10) so stale_cycles never fires and every page is yielded.
-    Instead, duplicate-key detection notices that the restarted cycle re-yields
-    already-seen keys and triggers key-only fallback after 3 consecutive
-    all-duplicate pages. This path is immune to JIRA's lexical key ordering, which
-    makes a numeric key cursor unsound (suffixes are non-monotonic: -1, -10, -2…).
+def test_search_seek_delta_advances_across_minutes_and_terminates(client, base_url):
+    """Several changed minutes, each drained then advanced past via the next-minute
+    probe; the scan emits every issue exactly once and terminates (bounded calls)."""
+    client._server_tz = UTC
+    dataset = [
+        {"id": "10", "key": "PROJ-10", "updated": "2026-05-18T10:00:10.000+0000"},
+        {"id": "11", "key": "PROJ-11", "updated": "2026-05-18T10:00:50.000+0000"},
+        {"id": "12", "key": "PROJ-12", "updated": "2026-05-18T10:03:00.000+0000"},
+        {"id": "13", "key": "PROJ-13", "updated": "2026-05-18T10:07:00.000+0000"},
+    ]
+    calls: list[str] = []
+    _fake_jira_delta_search(base_url, dataset, calls=calls)
+
+    pages = list(
+        client.search_seek("PROJ", after_ts=datetime(2026, 5, 18, 10, 0, tzinfo=UTC), page_size=20)
+    )
+
+    got = [i["key"] for p in pages for i in p.issues]
+    assert sorted(got) == ["PROJ-10", "PROJ-11", "PROJ-12", "PROJ-13"]
+    assert len(got) == 4  # no duplicates
+    assert len(calls) < 20  # bounded — no spin
+
+
+@responses.activate
+def test_search_seek_post_reindex_falls_back_to_id_scan(client, base_url):
+    """Post-reindex, the index matches `updated > cursor` but `fields.updated` still
+    shows older values. The next-minute probe then returns a row whose `updated` floors
+    at/below the cursor minute — the single reindex signal — and the scan falls back to a
+    full id scan (which never reads `updated`), tagging those pages `fallback=True`.
     """
+    client._server_tz = UTC
+    cursor = datetime(2026, 5, 19, 11, 51, tzinfo=UTC)
+    stale = "2024-07-14T19:37:16.000+0000"  # floors to 2024 — always behind the 2026 cursor
+    universe = [
+        {"id": "1", "key": "OPS-1"},
+        {"id": "2", "key": "OPS-2"},
+        {"id": "3", "key": "OPS-3"},
+    ]
 
-    def make_page(key: str, hour: int) -> dict:
-        ts = f"2024-01-01T{hour:02d}:00:00.000+0000"
-        issue = {"key": key, "id": key.rsplit("-", 1)[-1], "fields": {"updated": ts}}
-        return {"issues": [issue], "names": {}, "schema": {}}
+    def _callback(request):
+        jql = json.loads(request.body)["jql"]
+        if "updated < " in jql:  # half-open drain (has both >= and <)
+            issues = []  # the cursor minute itself has nothing
+        elif "updated >= " in jql:  # advance probe (>= only)
+            issues = [{"id": "1", "key": "OPS-1", "fields": {"updated": stale}}]  # lagging row
+        else:  # id-ordered fallback scan — no `updated` clause
+            after = int(g.group(1)) if (g := re.search(r"id > (\d+)", jql)) else 0
+            issues = [
+                {"id": u["id"], "key": u["key"], "fields": {"updated": stale}}
+                for u in universe
+                if int(u["id"]) > after
+            ]
+        return (200, {}, json.dumps({"issues": issues, "names": {}, "schema": {}}))
 
-    # 12 issues, each with a distinct timestamp spaced hours apart.
-    # Cycle length = 12 pages (page_size=1) — exceeds deque maxlen=10 so the
-    # (ts, key) boundary for page 1 is evicted before cycle 2 starts.
-    cycle_pages = [make_page(f"OPS-{i}", i) for i in range(1, 13)]
+    responses.add_callback(
+        responses.POST,
+        f"{base_url}/rest/api/2/search",
+        callback=_callback,
+        content_type="application/json",
+    )
 
-    key_only_page = make_page("OPS-99", 1)
-    empty_page = {"issues": [], "names": {}, "schema": {}}
+    pages = list(client.search_seek("OPS", after_ts=cursor, page_size=2))
 
-    # Cycle 1: 12 pages — populates seen_keys with OPS-1..OPS-12
-    for p in cycle_pages:
-        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=p)
-    # Cycle 2: 3 all-duplicate pages (OPS-1, OPS-2, OPS-3) — triggers fallback on page 3
-    for p in cycle_pages[:3]:
-        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=p)
-    # Key-only scan terminates normally
-    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=key_only_page)
-    responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=empty_page)
-
-    pages = list(client.search_seek("OPS", page_size=1))
-
-    all_keys = [i["key"] for p in pages for i in p.issues]
-    assert "OPS-99" in all_keys, "should reach key-only fallback page with OPS-99"
-    # Cycle 1 (12) + 3 regression pages (all yielded before fallback triggers) + 1 key-only = 16
-    assert len(pages) == 16, f"expected 16 pages, got {len(pages)}"
+    got = [i["key"] for p in pages for i in p.issues]
+    assert got == ["OPS-1", "OPS-2", "OPS-3"]  # full universe via the id scan
+    assert all(p.fallback for p in pages)  # every yielded page is from the fallback
 
 
 @responses.activate
-def test_search_seek_raises_parse_error_on_missing_updated(client, base_url):
-    """The delta path cursors on `updated`, so a page missing it is unrecoverable.
-    (A full scan cursors on `id` and never reads `updated`, so this guard is
-    delta-only — hence the after_ts.)"""
-    from datetime import datetime
-
+def test_search_seek_delta_raises_parse_error_on_missing_id(client, base_url):
+    """The delta drain advances on `id`, so a drain row missing it is unrecoverable."""
     responses.add(
         responses.POST,
         f"{base_url}/rest/api/2/search",
-        json={"issues": [{"key": "XX-1", "id": "1", "fields": {}}]},
+        json={"issues": [{"key": "XX-1", "fields": {"updated": "2026-01-01T00:00:00.000+0000"}}]},
     )
     with pytest.raises(JiraParseError):
         list(client.search_seek("XX", after_ts=datetime(2026, 1, 1, tzinfo=UTC)))
@@ -675,7 +698,7 @@ def test_search_paged_falls_back_to_hub(client, base_url, monkeypatch):
     assert pages[0].issues[0]["fields"]["issuelinks"] == [{"id": "9999"}]
 
 
-# ----- HTTP 400 (JQL error) handling — fast-fail + stale-key auto-recovery ---
+# ----- HTTP 400 (JQL error) handling — fast-fail, no cursor recovery -----
 
 
 @responses.activate
@@ -707,151 +730,12 @@ def test_search_400_raises_jql_error_immediately(client, base_url, monkeypatch):
 
 
 @responses.activate
-def test_search_seek_recovers_from_stale_after_key(client, base_url, monkeypatch):
-    """End-to-end: seek loop sees 400 'key X does not exist', clears its stale
-    tiebreaker, retries the same window without `key > X`, and continues. This
-    is the operator pain point — without auto-recovery the loop
-    would 400 forever once an admin deleted a previous cycle's after_key.
-    """
-    import time
-    from datetime import UTC, datetime
-
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-    client._server_tz = UTC  # skip the /serverInfo probe (not mocked here)
-
-    # First call (with after_key=STALE-99): 400 "key does not exist"
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={"errorMessages": ["An issue with key 'STALE-99' does not exist for field 'key'."]},
-        status=400,
-    )
-    # Second call (after_key cleared): succeeds with one issue, then empty page terminates.
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={
-            "issues": [
-                {"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}
-            ],
-            "names": {},
-            "schema": {},
-        },
-    )
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={"issues": [], "names": {}, "schema": {}},
-    )
-
-    pages = list(
-        client.search_seek(
-            "PROJ",
-            after_ts=datetime.fromisoformat("2026-05-20T06:00:00+00:00"),
-            after_key="STALE-99",
-        )
-    )
-    # The loop recovered: one page yielded, three total POSTs (400, recovery success, empty).
-    assert len(pages) == 1
-    assert pages[0].issues[0]["key"] == "OK-1"
-    assert len(responses.calls) == 3
-
-
-@responses.activate
-def test_search_seek_recovers_from_moved_issue_key(client, base_url, monkeypatch):
-    """Variant: JIRA returns 'Operator '>' cannot be applied to moved issue
-    key 'X'' when after_key references a reprojected issue. Hit in production
-    when an issue was moved between cycles. Same recovery as the
-    deleted-key variant — clear after_key, retry."""
-    import time
-    from datetime import UTC, datetime
-
-    monkeypatch.setattr(time, "sleep", lambda _: None)
+def test_search_seek_delta_propagates_jql_400(client, base_url):
+    """A 400 during the delta drain (e.g. a malformed extra_filter) is the caller's
+    bug — there is no cursor state to clear, so it propagates as JiraJqlError rather
+    than looping or being swallowed. The id-keyed cursor cannot itself 400, so the old
+    stale-`after_key` recovery path is gone."""
     client._server_tz = UTC
-
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={"errorMessages": ["Operator '>' cannot be applied to moved issue key 'MOVED-42'."]},
-        status=400,
-    )
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={
-            "issues": [
-                {"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}
-            ],
-            "names": {},
-            "schema": {},
-        },
-    )
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={"issues": [], "names": {}, "schema": {}},
-    )
-
-    pages = list(
-        client.search_seek("PROJ", after_ts=datetime(2026, 5, 20, tzinfo=UTC), after_key="MOVED-42")
-    )
-    assert len(pages) == 1
-    assert pages[0].issues[0]["key"] == "OK-1"
-
-
-@responses.activate
-def test_search_seek_recovers_from_invalid_key_format(client, base_url, monkeypatch):
-    """Variant: JIRA returns 'The issue key 'X' for field 'key' is invalid'
-    when after_key is malformed (no dash, etc.). Defensive — shouldn't
-    happen naturally from seek pagination, but if cursor data ever gets
-    corrupted, recover instead of looping forever."""
-    import time
-    from datetime import UTC, datetime
-
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-    client._server_tz = UTC
-
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={"errorMessages": ["The issue key 'BROKEN' for field 'key' is invalid."]},
-        status=400,
-    )
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={
-            "issues": [
-                {"key": "OK-1", "id": "1", "fields": {"updated": "2026-05-20T07:00:00.000+0000"}}
-            ],
-            "names": {},
-            "schema": {},
-        },
-    )
-    responses.add(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        json={"issues": [], "names": {}, "schema": {}},
-    )
-
-    pages = list(
-        client.search_seek("PROJ", after_ts=datetime(2026, 5, 20, tzinfo=UTC), after_key="BROKEN")
-    )
-    assert len(pages) == 1
-
-
-@responses.activate
-def test_search_seek_propagates_400_when_after_key_is_none(client, base_url, monkeypatch):
-    """If the stale-key error fires when there's no after_key to clear, the
-    auto-recovery has nothing to do — propagate the error rather than looping.
-    Otherwise a JQL bug elsewhere (e.g. malformed extra_filter) would silently
-    hang the loop forever."""
-    import time
-    from datetime import UTC
-
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-    client._server_tz = UTC
-
     responses.add(
         responses.POST,
         f"{base_url}/rest/api/2/search",
@@ -859,58 +743,7 @@ def test_search_seek_propagates_400_when_after_key_is_none(client, base_url, mon
         status=400,
     )
     with pytest.raises(JiraJqlError):
-        list(client.search_seek("PROJ"))  # no after_key set
-
-
-@responses.activate
-def test_search_seek_fallback_scans_by_id_not_key(client, base_url):
-    """The post-reindex fallback must page by issue id, not key.
-
-    JIRA evaluates `key > "X"` numerically (by issue number) but `ORDER BY key ASC`
-    lexically; mixing them makes a key cursor re-fetch the same page forever
-    (PROJ-1, PROJ-10, PROJ-100 sort before PROJ-2 lexically, yet a numeric
-    `key >` excludes them). This simulates that split semantics with a callback and
-    asserts the fallback advances by id and surfaces every issue. A key cursor would
-    loop on PROJ-1/PROJ-10 and never reach PROJ-2 or PROJ-20.
-    """
-    import json
-    import re
-    from datetime import UTC, datetime
-
-    # Lexically-scrambled keys with monotonic ids — the shape a key cursor breaks on.
-    universe = [
-        {"key": "PROJ-1", "id": "100", "fields": {"updated": "2024-01-01T00:00:00.000+0000"}},
-        {"key": "PROJ-10", "id": "101", "fields": {"updated": "2024-01-01T01:00:00.000+0000"}},
-        {"key": "PROJ-100", "id": "102", "fields": {"updated": "2024-01-01T02:00:00.000+0000"}},
-        {"key": "PROJ-2", "id": "103", "fields": {"updated": "2024-01-01T03:00:00.000+0000"}},
-        {"key": "PROJ-20", "id": "104", "fields": {"updated": "2024-01-01T04:00:00.000+0000"}},
-    ]
-
-    def cb(request):
-        jql = json.loads(request.body)["jql"]
-        if "ORDER BY id ASC" in jql:  # fallback phase: honour the numeric id cursor
-            assert "ORDER BY key" not in jql, "fallback must not order by key"
-            m = re.search(r"id > (\d+)", jql)
-            after = int(m.group(1)) if m else 0
-            batch = [i for i in universe if int(i["id"]) > after][:2]
-            return (200, {}, json.dumps({"issues": batch, "names": {}, "schema": {}}))
-        # Time-cursor phase: simulate the reindex loop — same two issues every call.
-        return (200, {}, json.dumps({"issues": universe[:2], "names": {}, "schema": {}}))
-
-    responses.add_callback(
-        responses.POST,
-        f"{base_url}/rest/api/2/search",
-        callback=cb,
-        content_type="application/json",
-    )
-
-    pages = list(client.search_seek("PROJ", after_ts=datetime(2026, 1, 1, tzinfo=UTC), page_size=2))
-    keys = {i["key"] for p in pages for i in p.issues}
-    assert keys == {"PROJ-1", "PROJ-10", "PROJ-100", "PROJ-2", "PROJ-20"}
-    # The flag lets incremental callers tell recovery pages apart from the time
-    # cursor: the first page is time-cursor (False), the recovery scan is True.
-    assert pages[0].fallback is False
-    assert pages[-1].fallback is True
+        list(client.search_seek("PROJ", after_ts=datetime(2026, 5, 20, tzinfo=UTC)))
 
 
 @responses.activate

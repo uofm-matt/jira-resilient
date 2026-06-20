@@ -50,11 +50,10 @@ for page in client.search_seek("PROJ"):
     for issue in page.issues:
         ...
 
-# Delta scan — resume from a saved (updated, key) cursor.
+# Delta scan — resume from a saved `updated` cursor (idempotent upserts absorb any overlap).
 from datetime import datetime, timezone
-cursor_ts  = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
-cursor_key = "PROJ-12345"
-for page in client.search_seek("PROJ", after_ts=cursor_ts, after_key=cursor_key):
+cursor_ts = datetime(2026, 5, 18, 7, 30, tzinfo=timezone.utc)
+for page in client.search_seek("PROJ", after_ts=cursor_ts):
     ...
 
 # Paginated changelog — for issues whose `expand=changelog` payload overflows the timeout.
@@ -97,13 +96,13 @@ Three reasons existing clients can't handle this:
 
 ### The Lucene reindex story
 
-The bug that took a day to find, and why `search_seek` has the monotonic-`after_ts` guard.
+The bug that took a day to find, and why `search_seek`'s delta scan drains one `updated` minute at a time.
 
 JIRA Server occasionally runs a Lucene reindex. After the reindex, the **indexed** `updated` timestamp on many issues is set to the reindex time. The document's `fields.updated` is unaffected.
 
 If you run a seek-paginated loop, advancing the cursor by `fields.updated` of the last issue on each page, you eventually hit a reindexed group: thousands of issues whose `fields.updated` is some old date (say, 2024) but whose indexed-`updated` is yesterday. Your next JQL says `updated > "old-date"`. JIRA's matcher uses the **indexed** value, so it returns the whole reindexed group — and your cursor just went *backward in time*. Next request, even broader. Infinite loop, no error, just chewing through the same group forever.
 
-The fix: `after_ts` is kept **monotonically non-decreasing** — `after_ts = max(after_ts, new_ts)`. Combined with a minute-advance fallback that preserves `after_key`, same-Lucene-timestamp groups page through cleanly by key alone, and the cursor can't regress. See [`client.py:search_seek`](src/jira_resilient/client.py).
+The fix: the delta scan never paginates *across* a minute on `updated`. It drains each minute with the half-open range `updated >= "MM" AND updated < "MM+1"` and seeks within it on issue `id` — a filter (`id > N`) and sort (`ORDER BY id ASC`) that agree exactly — then probes `updated >= "MM+1"` for the next changed minute. (A bare minute literal is the instant `MM:00` to JIRA Server, so `= "MM"` would match only the `:00`-second rows; the range captures the whole minute.) `id` and the minute both advance monotonically, so the cursor can't regress or loop, and a same-minute cluster of any size pages cleanly. A reindex shows up as the next-minute probe returning a row whose `fields.updated` is *not* past the cursor minute; that single signal switches to a full `id`-ordered scan, which never reads `updated`. See [`client.py:search_seek`](src/jira_resilient/client.py).
 
 ## API reference
 
@@ -153,7 +152,7 @@ The fix: `after_ts` is kept **monotonically non-decreasing** — `after_ts = max
 | `list_fields()` | `GET /field` | Full field catalog |
 | `list_keys(jql)` | `POST /search` (fields=key) | Tiny payload; for reconciliation |
 | `search_paged(jql, *, page_size=50)` | `POST /search` (offset) | Use sparingly — quadratic on large projects |
-| `search_seek(project_key, *, after_ts, after_key, extra_filter, page_size=20)` | `POST /search` (seek) | Project-wide enumeration. **Full scan** (`after_ts=None`) pages by issue `id` (monotonic, can't loop); **delta** (`after_ts` set) by `(updated, key)` with Lucene-reindex recovery |
+| `search_seek(project_key, *, after_ts, extra_filter, page_size=20)` | `POST /search` (seek) | Project-wide enumeration. **Full scan** (`after_ts=None`) pages by issue `id`; **delta** (`after_ts` set) drains each `updated` minute by `id` — immune to minute-precision and lexical-key skips — with a reindex→`id`-scan fallback. (Accepts a deprecated, ignored `after_key`.) |
 
 ### Exceptions
 
@@ -166,14 +165,14 @@ from jira_resilient import (
 )
 ```
 
-`JiraJqlError` (subclass of `JiraResilientError`, importable from `jira_resilient.exceptions`) is raised when JIRA rejects a query with HTTP 400 — it carries `error_messages: list[str]` from JIRA's response body so callers can pattern-match. `search_seek` uses it internally to decide whether a stale-cursor 400 is auto-recoverable.
+`JiraJqlError` (subclass of `JiraResilientError`, importable from `jira_resilient.exceptions`) is raised when JIRA rejects a query with HTTP 400 — it carries `error_messages: list[str]` from JIRA's response body so callers can pattern-match.
 
 `requests.RequestException` may still escape on conditions the library doesn't wrap. Catch `JiraResilientError` for library-raised failures, or `Exception` for everything.
 
 ### JQL helpers
 
 ```python
-from jira_resilient import build_jql, build_seek_jql
+from jira_resilient import build_jql
 ```
 
 Pure functions, no network calls — for callers that want to compose JQL outside of any request flow.
