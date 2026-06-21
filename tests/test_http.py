@@ -221,3 +221,15 @@ def test_session_blocks_cookies():
     state on the Session, making it safe to share across the fan-out of threads."""
     sess = make_session(pat="x")
     assert sess.cookies._policy is _BLOCK_ALL_COOKIES
+
+
+@responses.activate
+def test_retry_after_http_date_flows_through_request_with_retry(monkeypatch):
+    """An HTTP-date Retry-After is honored end-to-end, not just by the parser in isolation."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    future = format_datetime(datetime.now(UTC) + timedelta(seconds=45))
+    responses.add(responses.GET, "https://x/foo", status=429, headers={"Retry-After": future})
+    responses.add(responses.GET, "https://x/foo", json={"ok": True}, status=200)
+    request_with_retry(make_session(pat="x"), "GET", "https://x/foo")
+    assert sleeps and sleeps[0] == pytest.approx(45, abs=5)

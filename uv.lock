@@ -197,10 +197,11 @@ wheels = [
 
 [[package]]
 name = "jira-resilient"
-version = "0.4.4"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "requests" },
+    { name = "urllib3" },
 ]
 
 [package.optional-dependencies]
@@ -218,6 +219,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.31" },
     { name = "responses", marker = "extra == 'dev'", specifier = ">=0.25" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
+    { name = "urllib3", specifier = ">=2" },
 ]
 provides-extras = ["dev"]
 

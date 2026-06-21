@@ -962,7 +962,7 @@ def test_get_properties_skips_individual_404(client, base_url):
 @responses.activate
 def test_get_comment_properties_404_endpoint_returns_empty(client, base_url):
     """Some JIRA Server builds don't expose the comment-properties sub-resource —
-    a wholesale 404 must collapse to {} (observed live in production)."""
+    a wholesale 404 must collapse to {} (observed against a live server)."""
     responses.add(
         responses.GET,
         f"{base_url}/rest/api/2/issue/XX-1/comment/99/properties",

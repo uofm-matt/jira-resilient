@@ -2,6 +2,53 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] — 2026-06-20
+
+A correctness + hardening release. **Breaking:** the unsound `build_seek_jql` is removed and
+some error/return behaviors changed (see Removed/Changed).
+
+### Fixed
+- **Delta `search_seek` no longer silently skips issues.** The old `(updated, key)` cursor mixed
+  precisions — a bare minute date literal is the instant `MM:00` to JIRA Server, while
+  `ORDER BY updated` is second-precision — so same-minute clusters and later-second/smaller-id
+  rows were dropped. The delta scan now drains each minute with the half-open range
+  `updated >= "MM" AND updated < "MM+1"` and seeks within it on numeric issue `id` (filter and
+  sort agree exactly), then advances with a one-row `updated >= "MM+1"` probe. `id` and the
+  minute advance monotonically, so the scan cannot skip or loop; a reindex falls back to a full
+  `id`-ordered scan. Validated against a live JIRA Server on multi-hundred-issue same-minute
+  bulk clusters.
+- **Hub-tier search no longer fabricates `issuelinks = []`** when a per-issue issuelinks fetch
+  fails — the key is left ABSENT so callers can tell "fetch failed" from "no links."
+- **Pagination treats an absent `total` as "keep paging,"** not 0 (which truncated after one
+  page) — `get_changelog` / `get_worklogs` / `get_comments` / `list_keys` / `search_paged`.
+- **`get_changelog` no longer disables the paginated endpoint on an issue-404** — it confirms the
+  issue exists first, so one missing issue can't poison the route for all.
+- **Redirects are not followed** on REST calls (a proxy/SSO 3xx would turn `POST /search` into a
+  body-less GET); a 3xx surfaces as an error.
+- **`verify=False` works** (the self-signed escape hatch no longer raises a TLS `ValueError`), and
+  the TLS-1.2 floor now applies to proxied connections too.
+- **`get_remote_links`** raises `JiraParseError` on a non-list 200 body (error envelope) instead of
+  returning it as data; **`is_authenticated` / `list_fields`** guard a non-JSON 200.
+
+### Changed
+- **`request_with_retry` is the single capped Retry-After authority** for both 429 and 5xx (the
+  adapter no longer retries HTTP statuses); on exhaustion it raises the real 429/5xx response, not
+  a bare error.
+- **401/403 raise `JiraAuthError`** (was a raw `HTTPError`); a 4xx during the resilient fetch fails
+  fast instead of burning all three tiers; degradation to hub/minimal is logged.
+- **The session blocks cookies** (PAT auth needs none), removing shared mutable state so one
+  session is safe to share across a thread fan-out.
+- **`get_user` requires exactly one** of `username` / `key` / `account_id`.
+
+### Removed
+- **`build_seek_jql`** — it emitted the unsound single-shot cursor JQL. Sound delta pagination now
+  lives in `JiraClient.search_seek`. `search_seek` still accepts `after_key` but ignores it
+  (deprecated; the within-minute tiebreaker is internal).
+
+### Added
+- `JiraJqlError` is exported from the package root; `urllib3` is a declared dependency; the typed
+  package gains the `Typing :: Typed` and Python 3.13 classifiers.
+
 ## [0.4.4] — 2026-06-07
 
 ### Added
@@ -155,8 +202,8 @@ verified live against a JIRA Server instance before release.
 - **`search_seek` auto-recovers from two more `after_key` failure modes**
   in addition to the deleted-issue case shipped in 0.2.1:
   - `"Operator '>' cannot be applied to moved issue key 'X'."` — fires
-    when the cursor's after_key was reprojected to another project.
-    Hit in production one hour after the 0.2.1 deploy.
+    when the cursor's `after_key` references an issue reprojected to another
+    project. Observed in the field shortly after 0.2.1.
   - `"The issue key 'X' for field 'key' is invalid."` — defensive: fires
     if cursor data is somehow malformed (no dash, wrong shape). Doesn't
     happen organically from the seek loop but recovers if it ever does.
@@ -182,10 +229,9 @@ verified live against a JIRA Server instance before release.
   and retries the same window without the tiebreaker. Idempotent upserts
   on the caller side absorb the slight widening.
 
-  Production trigger: a JIRA admin deletion of a project's most-recent
-  issue silently broke that project's delta sync, with every cycle
-  failing identically until an operator manually NULL'd `after_key`
-  in the cursor store. Now the loop self-heals on the next cycle.
+  Trigger: a JIRA admin deleting a project's most-recent issue breaks that
+  project's delta sync — every subsequent cycle 400s identically until the
+  stale `after_key` is cleared. The loop now self-heals on the next cycle.
 
 ### Changed
 - **`_search_one_page` fast-fails on HTTP 400** instead of falling through
@@ -287,11 +333,11 @@ only callers using the kwargs need to switch to `get_issue_raw`.
   minute that contained more issues than the page size, JIRA's JQL minute-precision
   semantics caused `updated > "X:Y"` to re-match every issue in the X:Y minute on
   every page. The seek paginator's `prev_boundary == current_boundary` check only
-  caught 1-page cycles; 3-page cycles (production: keys rotating between three
+  caught 1-page cycles; longer cycles (keys rotating between several
   values within one minute) bypassed it and ran forever. Replaced with a deque of
   recent boundaries — any repeat within the last 10 pages now forces a
   minute-advance and clears `after_key`. Regression test added.
-  Production symptom: a delta-sync loader fetched 11,000+ rows of a ~600-row gap
+  Symptom: a delta loop re-fetched a small same-minute gap many times over
   without ever progressing past the boundary minute.
 
 ## [0.1.1] — 2026-05-19
