@@ -8,11 +8,10 @@ import re
 from datetime import UTC, datetime
 
 import pytest
-import requests
 import responses
 
 from jira_resilient import JiraClient, JiraFetchError, JiraParseError
-from jira_resilient.exceptions import JiraJqlError
+from jira_resilient.exceptions import JiraAuthError, JiraJqlError
 
 
 def _fake_jira_delta_search(base_url, dataset, *, calls=None):
@@ -159,11 +158,11 @@ def test_get_changelog_falls_back_to_expand_on_404(client, base_url):
 
 @responses.activate
 def test_get_changelog_non_404_http_error_propagates(client, base_url):
-    # A non-404 HTTP error on the paginated route must NOT silently fall back to
-    # expand (no /issue/XX-1 mock is registered, so a fallback would also fail). 403
-    # is a fail-fast 4xx (unlike 5xx, which urllib3 retries).
+    # A non-404 error on the paginated route must NOT silently fall back to expand (no
+    # /issue/XX-1 mock is registered, so a fallback would also fail). A 403 surfaces as
+    # JiraAuthError (WP-4) — still no expand fallback.
     responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/changelog", status=403)
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(JiraAuthError):
         client.get_changelog("XX-1")
 
 
@@ -899,7 +898,9 @@ def test_get_user_returns_empty_on_404(client, base_url):
 
 def test_get_user_requires_an_identifier(client):
     with pytest.raises(ValueError, match="username, key, or account_id"):
-        client.get_user()
+        client.get_user()  # zero
+    with pytest.raises(ValueError, match="exactly one"):
+        client.get_user(username="bob", key="JIRAUSER10000")  # two — ambiguous
 
 
 # ----- entity properties --------------------------------------------------------
@@ -1047,3 +1048,64 @@ def test_get_worklogs_keeps_paging_when_total_absent(client, base_url):
     )
     responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/worklog", json={"worklogs": []})
     assert client.get_worklogs("XX-1", page_size=2) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+
+
+# ----- WP-4: error taxonomy & contract fidelity ---------------------------
+
+
+@responses.activate
+def test_401_raises_jira_auth_error(client, base_url):
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/remotelink", status=401)
+    with pytest.raises(JiraAuthError):
+        client.get_remote_links("XX-1")
+
+
+@responses.activate
+def test_get_changelog_issue_404_does_not_disable_endpoint(client, base_url):
+    """A 404 because the ISSUE is gone (not the endpoint) must re-raise and leave the
+    paginated route enabled for everyone else."""
+    import requests as _requests
+
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/GONE-1/changelog", status=404)
+    responses.add(
+        responses.GET, f"{base_url}/rest/api/2/issue/GONE-1", status=404
+    )  # existence probe
+    with pytest.raises(_requests.exceptions.HTTPError):
+        client.get_changelog("GONE-1")
+    assert client._changelog_paginated is True  # endpoint NOT disabled by an issue-404
+
+
+@responses.activate
+def test_get_changelog_endpoint_404_disables_when_issue_exists(client, base_url):
+    """A 404 with the issue PRESENT means the endpoint is absent (JIRA Server): disable it
+    and fall back to ?expand=changelog."""
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/changelog", status=404)
+    responses.add(
+        responses.GET, f"{base_url}/rest/api/2/issue/XX-1", json={"key": "XX-1"}
+    )  # exists
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1",
+        json={"changelog": {"histories": [{"id": "9"}]}},
+    )
+    assert client.get_changelog("XX-1") == [{"id": "9"}]
+    assert client._changelog_paginated is False  # endpoint disabled
+
+
+@responses.activate
+def test_issue_property_key_is_percent_encoded(client, base_url):
+    base = f"{base_url}/rest/api/2/issue/XX-1"
+    responses.add(responses.GET, f"{base}/properties", json={"keys": [{"key": "a/b key"}]})
+    # The dereference must percent-encode the key, else the path breaks on the `/` and space.
+    responses.add(
+        responses.GET,
+        f"{base}/properties/a%2Fb%20key",
+        json={"key": "a/b key", "value": {"x": 1}},
+    )
+    assert client.get_issue_properties("XX-1") == {"a/b key": {"x": 1}}
+
+
+def test_jira_jql_error_is_exported():
+    import jira_resilient
+
+    assert jira_resilient.JiraJqlError is not None and "JiraJqlError" in jira_resilient.__all__

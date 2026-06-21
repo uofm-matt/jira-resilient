@@ -28,6 +28,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib3.util.ssl_ import create_urllib3_context
 
+from jira_resilient.exceptions import JiraAuthError
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,6 +178,10 @@ def request_with_retry(
                 )
                 time.sleep(wait)
                 continue
+            if resp.status_code in (401, 403):
+                raise JiraAuthError(
+                    f"{method} {url}: HTTP {resp.status_code} — authentication/authorization failed"
+                )
             resp.raise_for_status()
             return resp
         except requests.exceptions.HTTPError:

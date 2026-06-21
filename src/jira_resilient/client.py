@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, tzinfo
 from typing import Any, TypeGuard
+from urllib.parse import quote
 
 import requests
 
@@ -110,6 +112,7 @@ class JiraClient:
         # sub-resource; JIRA Server returns 404 for it. Probe once, then cache so we
         # use the inline ?expand=changelog route directly on Server (see get_changelog).
         self._changelog_paginated = True
+        self._changelog_lock = threading.Lock()  # guards the one-way flip under fan-out
 
     # ----- auth ---------------------------------------------------------------
 
@@ -122,7 +125,13 @@ class JiraClient:
             logger.error("Auth check error: %s", exc)
             return False
         if resp.status_code == 200:
-            logger.info("Auth OK: %s", resp.json().get("displayName", "unknown"))
+            try:
+                name = resp.json().get("displayName", "unknown")
+            except ValueError:
+                # A 200 with a non-JSON body is an SSO/proxy login page, not an authed myself.
+                logger.error("Auth check: HTTP 200 but a non-JSON body (SSO/proxy login page?)")
+                return False
+            logger.info("Auth OK: %s", name)
             return True
         logger.error("Auth failed: HTTP %d", resp.status_code)
         return False
@@ -225,8 +234,12 @@ class JiraClient:
         payloads stay under the timeout even for thousands of entries). That route is
         a JIRA Cloud / some-DC feature, though — JIRA **Server** returns 404 for it,
         in which case we fall back to the inline `?expand=changelog` route (the only
-        one Server offers). The 404 result is cached on the client so we don't re-probe
-        the missing endpoint on every issue.
+        one Server offers). The endpoint-missing result is cached on the client so we
+        don't re-probe on every issue.
+
+        A 404 is ambiguous: the ENDPOINT is absent (disable it for all issues) OR this
+        ISSUE doesn't exist (re-raise, don't poison the route). We only disable the
+        endpoint after confirming the issue itself exists.
         """
         if self._changelog_paginated:
             try:
@@ -234,11 +247,25 @@ class JiraClient:
             except requests.exceptions.HTTPError as exc:
                 if exc.response is None or exc.response.status_code != 404:
                     raise
-                self._changelog_paginated = False
+                if not self._issue_exists(key):
+                    raise  # issue-404, not endpoint-404 — don't disable the route for everyone
+                with self._changelog_lock:
+                    self._changelog_paginated = False
                 logger.info(
                     "paginated changelog endpoint not available (404) — using ?expand=changelog"
                 )
         return self._changelog_expand(key)
+
+    def _issue_exists(self, key: str) -> bool:
+        """Cheap existence probe (`fields=key`) to disambiguate an endpoint-404 from an
+        issue-404. Raises on non-404 errors (don't swallow a transient failure)."""
+        try:
+            self.get_issue_raw(key, fields="key", expand="", timeout=30, max_attempts=2)
+        except requests.exceptions.HTTPError as exc:
+            if _is_http_404(exc):
+                return False
+            raise
+        return True
 
     def _changelog_paged(self, key: str, page_size: int) -> list[dict]:
         url = f"{self.base_url}/rest/api/2/issue/{key}/changelog"
@@ -354,9 +381,9 @@ class JiraClient:
         `emailAddress`, `displayName`, `active`, `timeZone`). The watcher *count*
         is already on the issue payload (`fields.watches.watchCount`); this
         endpoint is the only way to get the identities, and only if the caller
-        has the "View Voters and Watchers" permission. Returns `[]` when the
-        sub-resource is absent (404), mirroring `get_remote_links`' absence
-        handling.
+        has the "View Voters and Watchers" permission. Returns `[]` on a 404
+        (sub-resource absent / no permission / issue gone). (`get_remote_links`
+        does NOT do this — it raises on 404 — so don't assume parity.)
         """
         url = f"{self.base_url}/rest/api/2/issue/{key}/watchers"
         try:
@@ -415,8 +442,8 @@ class JiraClient:
             )
             if v is not None
         }
-        if not (username or key or account_id):
-            raise ValueError("get_user requires one of username, key, or account_id")
+        if sum(v is not None for v in (username, key, account_id)) != 1:
+            raise ValueError("get_user requires exactly one of username, key, or account_id")
         url = f"{self.base_url}/rest/api/2/user"
         try:
             return request_with_retry(
@@ -456,7 +483,7 @@ class JiraClient:
                 value = request_with_retry(
                     self.session,
                     "GET",
-                    f"{list_url}/{prop_key}",
+                    f"{list_url}/{quote(prop_key, safe='')}",
                     timeout=30,
                     max_attempts=3,
                 ).json()
@@ -549,11 +576,15 @@ class JiraClient:
     # ----- field catalog ------------------------------------------------------
 
     def list_fields(self) -> list[dict]:
-        """`GET /rest/api/2/field`. Raises `requests.RequestException` on failure."""
+        """`GET /rest/api/2/field`. Raises `requests.RequestException` on a failed request,
+        or `JiraParseError` if a 200 body is not JSON (SSO/proxy HTML)."""
         url = f"{self.base_url}/rest/api/2/field"
         resp = self.session.get(url, timeout=30)
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise JiraParseError(f"list_fields: 200 but non-JSON body from {url}") from exc
 
     # ----- listings -----------------------------------------------------------
 

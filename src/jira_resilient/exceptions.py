@@ -35,9 +35,7 @@ class JiraJqlError(JiraResilientError):
     Distinct from JiraFetchError: a 400 means the QUERY is wrong, not that
     the connection/payload is wrong. Falling through to lower fetch tiers
     (which use the same JQL) can't help. `error_messages` carries JIRA's
-    `errorMessages` array verbatim so callers can pattern-match (e.g. seek
-    pagination recognizes "An issue with key 'X' does not exist for field
-    'key'" and clears its stale tiebreaker).
+    `errorMessages` array verbatim so callers can introspect the rejection.
     """
 
     def __init__(self, message: str, error_messages: list[str] | None = None):

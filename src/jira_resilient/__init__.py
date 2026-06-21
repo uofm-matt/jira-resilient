@@ -24,6 +24,7 @@ from jira_resilient.client import JiraClient
 from jira_resilient.exceptions import (
     JiraAuthError,
     JiraFetchError,
+    JiraJqlError,
     JiraParseError,
     JiraResilientError,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "JiraAuthError",
     "JiraClient",
     "JiraFetchError",
+    "JiraJqlError",
     "JiraParseError",
     "JiraResilientError",
     "ResilientFetchResult",
