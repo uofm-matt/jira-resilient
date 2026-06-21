@@ -44,6 +44,17 @@ def _is_http_404(exc: BaseException) -> TypeGuard[requests.HTTPError]:
     )
 
 
+def _is_client_error(exc: BaseException) -> bool:
+    """A 4xx other than 429 — the request is wrong (gone/forbidden/bad), so retrying the
+    SAME key at a lower tier fails identically. 429 is excluded (rate-limit, retryable)."""
+    return (
+        isinstance(exc, requests.HTTPError)
+        and exc.response is not None
+        and 400 <= exc.response.status_code < 500
+        and exc.response.status_code != 429
+    )
+
+
 def _jql_error_from(exc: requests.HTTPError, jql: str) -> JiraJqlError:
     """Preserve JIRA's `errorMessages` list verbatim for caller introspection."""
     messages: list[str] = []
@@ -245,7 +256,8 @@ class JiraClient:
             page = data.get("values") or []
             histories.extend(page)
             start_at += len(page)
-            if not page or start_at >= data.get("total", 0):
+            total = data.get("total")
+            if not page or (total is not None and start_at >= total):
                 break
         return histories
 
@@ -284,7 +296,8 @@ class JiraClient:
             page = data.get("worklogs") or []
             worklogs.extend(page)
             start_at += len(page)
-            if not page or start_at >= data.get("total", 0):
+            total = data.get("total")
+            if not page or (total is not None and start_at >= total):
                 break
         return worklogs
 
@@ -311,7 +324,8 @@ class JiraClient:
             page = data.get("comments") or []
             comments.extend(page)
             start_at += len(page)
-            if not page or start_at >= data.get("total", 0):
+            total = data.get("total")
+            if not page or (total is not None and start_at >= total):
                 break
         return comments
 
@@ -321,18 +335,17 @@ class JiraClient:
         Remote links (Confluence pages, GitHub PRs, external URLs) are not
         included in search responses — they require this dedicated endpoint.
         JIRA returns all remote links in a single non-paginated response.
+
+        Raises `JiraParseError` if a 200 body is a non-list (e.g. an SSO/proxy error
+        envelope) rather than masking it as "no remote links".
         """
         url = f"{self.base_url}/rest/api/2/issue/{key}/remotelink"
-        return (
-            request_with_retry(
-                self.session,
-                "GET",
-                url,
-                timeout=30,
-                max_attempts=3,
-            ).json()
-            or []
-        )
+        data = request_with_retry(self.session, "GET", url, timeout=30, max_attempts=3).json()
+        if isinstance(data, list):
+            return data
+        if data:  # a non-list, non-empty 200 body is an error envelope, not data
+            raise JiraParseError(f"remotelink for {key!r} returned a non-list body: {data!r}")
+        return []
 
     def get_watchers(self, key: str) -> list[dict]:
         """Watcher identity list via `/rest/api/2/issue/{key}/watchers`.
@@ -483,18 +496,26 @@ class JiraClient:
     def get_issue_resilient(self, key: str) -> ResilientFetchResult:
         """Three-tier resilient fetch.
 
-        Tier 1: full `*all` + changelog (~60s, 2 attempts).
+        Tier 1: full `*all` (`expand=names,schema`; NOT changelog — fetch that
+                separately via `get_changelog`, which paginates and stays under timeout).
         Tier 2: `*all,-issuelinks` + a separate `issuelinks` fetch (long timeout).
         Tier 3: minimal field set — description + custom_fields will be empty.
 
-        On total failure (all three tiers exhausted) raises `JiraFetchError`
-        with the underlying exception chain.
+        A 4xx client error (deleted/forbidden issue) fails fast: lower tiers fetch
+        the SAME key and would fail identically, so they are not attempted. A
+        degradation to hub/minimal is logged as a warning (the result is partial:
+        minimal drops description + custom_fields). On total failure raises
+        `JiraFetchError` with the underlying exception chain.
         """
         fast_fail = {"timeout": 60, "max_attempts": 2}
         try:
             issue = self.get_issue_raw(key, expand="names,schema", **fast_fail)
             return ResilientFetchResult(issue, "full")
         except requests.RequestException as exc_full:
+            if _is_client_error(exc_full):
+                raise JiraFetchError(
+                    f"fetch failed for {key!r} (client error, no tier retry): {exc_full!r}"
+                ) from exc_full
             try:
                 issue = self.get_issue_raw(
                     key,
@@ -503,10 +524,21 @@ class JiraClient:
                     **fast_fail,
                 )
                 issue.setdefault("fields", {})["issuelinks"] = self.get_issuelinks(key)
+                logger.warning("get_issue %s degraded to hub tier (%s)", key, exc_full)
                 return ResilientFetchResult(issue, "hub")
             except requests.RequestException as exc_hub:
+                if _is_client_error(exc_hub):
+                    raise JiraFetchError(
+                        f"fetch failed for {key!r} (client error, no tier retry): {exc_hub!r}"
+                    ) from exc_hub
                 try:
                     issue = self.get_issue_minimal(key)
+                    logger.warning(
+                        "get_issue %s degraded to MINIMAL tier (%s) — description + "
+                        "custom_fields are empty in this result",
+                        key,
+                        exc_hub,
+                    )
                     return ResilientFetchResult(issue, "minimal")
                 except requests.RequestException as exc_min:
                     raise JiraFetchError(
@@ -548,7 +580,8 @@ class JiraClient:
             page = [i["key"] for i in data.get("issues", [])]
             keys.extend(page)
             start_at += len(page)
-            if not page or start_at >= data.get("total", 0):
+            total = data.get("total")
+            if not page or (total is not None and start_at >= total):
                 break
         return keys
 
@@ -576,7 +609,8 @@ class JiraClient:
                 break
             yield SearchPage(issues, data.get("names") or {}, data.get("schema") or {}, tier=tier)
             start_at += len(issues)
-            if start_at >= data.get("total", 0):
+            total = data.get("total")
+            if total is not None and start_at >= total:
                 break
 
     def search_seek(
@@ -838,12 +872,15 @@ class JiraClient:
                         issue.setdefault("fields", {})["issuelinks"] = self.get_issuelinks(key)
                     except requests.RequestException as exc_links:
                         logger.warning(
-                            "issuelinks fetch failed for %s in hub tier (%s); "
-                            "leaving issuelinks empty for this issue",
+                            "issuelinks fetch failed for %s in hub tier (%s); leaving "
+                            "issuelinks ABSENT (not []) so callers can tell 'fetch failed' "
+                            "from 'no links'",
                             key,
                             exc_links,
                         )
-                        issue.setdefault("fields", {})["issuelinks"] = []
+                        # Do NOT fabricate `issuelinks = []`: a `[]` reads as authoritative
+                        # "no links" and would let a consumer overwrite real links. Absence
+                        # is the per-issue degradation signal (the page tier is already "hub").
                 return data, "hub"
             except requests.RequestException as exc_hub:
                 logger.warning(

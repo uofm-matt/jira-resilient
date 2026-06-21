@@ -583,8 +583,9 @@ def test_search_seek_hub_tier_tolerates_issuelinks_failure(client, base_url, mon
     pages = list(client.search_seek("XX"))
     assert len(pages) == 1
     assert pages[0].tier == "hub"
-    # The issuelinks fetch failed, so we get an empty list, not a missing key.
-    assert pages[0].issues[0]["fields"]["issuelinks"] == []
+    # The issuelinks fetch failed, so the key is ABSENT (not a fabricated []), so a caller
+    # can distinguish "fetch failed" from "genuinely no links" and not overwrite real links.
+    assert "issuelinks" not in pages[0].issues[0]["fields"]
 
 
 # ----- API inversion (0.2.0): get_issue is resilient by default, raw is the escape hatch ---
@@ -997,3 +998,52 @@ def test_get_comment_properties_lists_then_dereferences(client, base_url):
         json={"key": "sd.public.comment", "value": {"internal": False}},
     )
     assert client.get_comment_properties("XX-1", "99") == {"sd.public.comment": {"internal": False}}
+
+
+# ----- WP-2: degraded-data observability ----------------------------------
+
+
+@responses.activate
+def test_get_remote_links_raises_on_non_list_body(client, base_url):
+    # A 200 whose body is a dict (SSO/proxy error envelope) must NOT be masked as data.
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/remotelink",
+        json={"errorMessages": ["not authenticated"]},
+    )
+    with pytest.raises(JiraParseError):
+        client.get_remote_links("XX-1")
+
+
+@responses.activate
+def test_get_remote_links_empty_list_ok(client, base_url):
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/remotelink", json=[])
+    assert client.get_remote_links("XX-1") == []
+
+
+@responses.activate
+def test_get_issue_resilient_fast_fails_on_4xx(client, base_url):
+    # A deleted/forbidden issue (404) must fail fast — lower tiers fetch the same key and
+    # would 404 identically, so they are NOT attempted.
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/GONE-1", status=404)
+    with pytest.raises(JiraFetchError):
+        client.get_issue_resilient("GONE-1")
+    assert len(responses.calls) == 1  # no hub/minimal retry
+
+
+@responses.activate
+def test_get_worklogs_keeps_paging_when_total_absent(client, base_url):
+    # JIRA variants that omit `total`: a FULL first page must not stop the loop (the old
+    # `data.get("total", 0)` read absent total as 0 → silent one-page truncation).
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/worklog",
+        json={"worklogs": [{"id": "1"}, {"id": "2"}]},  # full page, no total
+    )
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/worklog",
+        json={"worklogs": [{"id": "3"}]},  # more, no total
+    )
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/worklog", json={"worklogs": []})
+    assert client.get_worklogs("XX-1", page_size=2) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
