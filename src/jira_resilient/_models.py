@@ -40,7 +40,8 @@ class ResilientFetchResult(NamedTuple):
 
     `tier` records WHICH fallback path succeeded — callers usually log this so
     operators know which keys are pathological:
-        - "full"    — fields=*all with changelog+names+schema (default path)
+        - "full"    — fields=*all with names+schema (default path; changelog is
+                      NOT expanded — fetch it separately via get_changelog)
         - "hub"     — fields=*all,-issuelinks plus a separate issuelinks fetch
         - "minimal" — minimal field set (description + custom_fields lost)
     """

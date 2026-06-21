@@ -70,8 +70,8 @@ Every JIRA Python client on PyPI today (`jira`, `atlassian-python-api`, `pycontr
 | Problem | Other clients | `jira-resilient` |
 |---|---|---|
 | **Hub issues with thousands of issuelinks** — `fields=*all` payload exceeds 120s timeout, request fails | issue unrecoverable, silently absent from your data | three-tier fetch: `full` → `*all,-issuelinks` + separate links fetch with long timeout → minimal fields |
-| 100K+ issue projects — offset pagination is ~O(n²) on JIRA Server | "limit your queries" (Atlassian's documented guidance) | `search_seek` — `(updated, key)` tuple cursor in JQL, `startAt=0` every request, bounded per-page cost |
-| Lucene reindex makes seek cursors silently regress | n/a — no client implements seek | monotonic `after_ts` floor + minute-advance fallback (the war story below) |
+| 100K+ issue projects — offset pagination is ~O(n²) on JIRA Server | "limit your queries" (Atlassian's documented guidance) | `search_seek` — drains each `updated`-minute by numeric issue `id` (`updated >= "MM" AND updated < "MM+1"`, `startAt=0` every request), bounded per-page cost |
+| Lucene reindex makes seek cursors silently regress | n/a — no client implements seek | one-row next-minute probe to advance, falling back to a full `id`-ordered scan when `fields.updated` lags the index (the war story below) |
 | Huge changelogs overflow `expand=changelog` | request fails; history lost | paginated `/issue/{key}/changelog`, auto-falling back to `?expand=changelog` on JIRA Server (which 404s the paginated route) |
 | 4xx in the retry loop | exponential backoff over a permission error wastes 15 min | fail-fast on 4xx; only 429/5xx trigger backoff |
 

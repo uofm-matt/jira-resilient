@@ -528,11 +528,16 @@ class JiraClient:
         Tier 2: `*all,-issuelinks` + a separate `issuelinks` fetch (long timeout).
         Tier 3: minimal field set — description + custom_fields will be empty.
 
-        A 4xx client error (deleted/forbidden issue) fails fast: lower tiers fetch
-        the SAME key and would fail identically, so they are not attempted. A
-        degradation to hub/minimal is logged as a warning (the result is partial:
-        minimal drops description + custom_fields). On total failure raises
-        `JiraFetchError` with the underlying exception chain.
+        A 4xx client error fails fast (lower tiers fetch the SAME key and would
+        fail identically, so they are not attempted), but the exception TYPE
+        depends on the status: a 404/410 (gone/deleted) raises `JiraFetchError`;
+        a 401/403 (unauthorized/forbidden) raises `JiraAuthError` — it is raised
+        by `request_with_retry` and propagates uncaught through the
+        `requests.RequestException` handler (JiraAuthError is not a
+        RequestException). A degradation to hub/minimal is logged as a warning
+        (the result is partial: minimal drops description + custom_fields). On
+        total failure with non-4xx errors raises `JiraFetchError` with the
+        underlying exception chain.
         """
         fast_fail = {"timeout": 60, "max_attempts": 2}
         try:
@@ -794,8 +799,8 @@ class JiraClient:
             if nxt is None:
                 return
             if nxt <= minute:
-                # The probe matched `updated > minute` yet returned a row whose
-                # `updated` is not past it: fields.updated lags the index, i.e. a
+                # The probe asked for `updated >= minute+1` yet returned a row whose
+                # `updated` is not past `minute`: fields.updated lags the index, i.e. a
                 # reindex. Fall back to an id scan, which ignores `updated` entirely.
                 logger.warning(
                     "seek project=%s: next-minute probe returned %s <= cursor %s "
@@ -870,10 +875,10 @@ class JiraClient:
         callers always pass `0` (default).
 
         Raises:
-          - `JiraJqlError` immediately on HTTP 400 — the QUERY is wrong (e.g.
-            tiebreaker key no longer exists in JIRA), so falling through to
-            hub/minimal tiers (which use the same JQL) can't help. Caller
-            decides whether to clear cursor state and retry.
+          - `JiraJqlError` immediately on HTTP 400 — the QUERY is wrong (e.g. an
+            `issuekey in (...)` batch naming a deleted/moved key, or an unknown
+            field), so falling through to hub/minimal tiers (which use the same
+            JQL) can't help. Caller decides whether to bisect the batch or retry.
           - `JiraFetchError` only if all three tiers fail with non-400 errors.
         """
         url = f"{self.base_url}/rest/api/2/search"

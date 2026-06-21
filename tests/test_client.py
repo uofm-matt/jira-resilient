@@ -1024,12 +1024,24 @@ def test_get_remote_links_empty_list_ok(client, base_url):
 
 @responses.activate
 def test_get_issue_resilient_fast_fails_on_4xx(client, base_url):
-    # A deleted/forbidden issue (404) must fail fast — lower tiers fetch the same key and
-    # would 404 identically, so they are NOT attempted.
+    # A deleted issue (404) must fail fast — lower tiers fetch the same key and would 404
+    # identically, so they are NOT attempted. 404 maps to JiraFetchError.
     responses.add(responses.GET, f"{base_url}/rest/api/2/issue/GONE-1", status=404)
     with pytest.raises(JiraFetchError):
         client.get_issue_resilient("GONE-1")
     assert len(responses.calls) == 1  # no hub/minimal retry
+
+
+@responses.activate
+def test_get_issue_resilient_fast_fails_on_403_as_auth_error(client, base_url):
+    # A forbidden issue (403) also fails fast (calls=1), but surfaces JiraAuthError — NOT
+    # JiraFetchError. request_with_retry raises it and it propagates uncaught through the
+    # `except requests.RequestException` tier-1 handler (JiraAuthError is not a RequestException).
+    # Consumers must catch JiraResilientError (the family base), not just JiraFetchError.
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/SECRET-1", status=403)
+    with pytest.raises(JiraAuthError):
+        client.get_issue_resilient("SECRET-1")
+    assert len(responses.calls) == 1
 
 
 @responses.activate
