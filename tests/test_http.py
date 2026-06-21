@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ssl
 import time
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -11,6 +12,7 @@ import requests
 import responses
 
 from jira_resilient.http import (
+    _BLOCK_ALL_COOKIES,
     _MAX_WAIT_SECONDS,
     _RETRY,
     _retry_after_seconds,
@@ -141,3 +143,81 @@ def test_retry_after_seconds_http_date_future():
 def test_retry_after_seconds_http_date_past_clamps_zero():
     header = format_datetime(datetime.now(UTC) - timedelta(seconds=120))
     assert _retry_after_seconds(_resp_with(header)) == 0.0
+
+
+# ----- WP-3: HTTP / TLS / session hardening --------------------------------
+
+
+@responses.activate
+def test_redirect_is_not_followed(monkeypatch):
+    """A 3xx on a REST call means a proxy/SSO interposed; following it would re-issue
+    POST /search as a body-less GET. It must surface as an error, not be followed."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    responses.add(
+        responses.POST,
+        "https://x/rest/api/2/search",
+        status=302,
+        headers={"Location": "https://sso/login"},
+    )
+    with pytest.raises(requests.exceptions.HTTPError) as ei:
+        request_with_retry(
+            make_session(pat="x"), "POST", "https://x/rest/api/2/search", json={"jql": "x"}
+        )
+    assert ei.value.response.status_code == 302  # surfaced, not silently followed
+
+
+def test_verify_false_relaxes_ssl_context():
+    """The self-signed escape hatch must not raise `ValueError: Cannot set verify_mode to
+    CERT_NONE when check_hostname is enabled` from the custom TLS-1.2 context."""
+    sess = make_session(pat="x", verify=False)
+    assert sess.verify is False
+    ctx = sess.get_adapter("https://example.com")._ssl_context()
+    assert ctx.verify_mode == ssl.CERT_NONE and ctx.check_hostname is False
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_verify_true_keeps_cert_verification():
+    ctx = make_session(pat="x", verify=True).get_adapter("https://example.com")._ssl_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
+
+
+@responses.activate
+def test_terminal_429_preserves_response(monkeypatch):
+    """When 429s exhaust the retries, the caller gets the REAL 429 (an HTTPError with the
+    response attached), not a bare RequestException with the status discarded."""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    for _ in range(3):
+        responses.add(responses.GET, "https://x/foo", status=429)
+    with pytest.raises(requests.exceptions.HTTPError) as ei:
+        request_with_retry(make_session(pat="x"), "GET", "https://x/foo", max_attempts=3)
+    assert ei.value.response.status_code == 429
+
+
+@responses.activate
+def test_5xx_retried_by_app_then_succeeds(monkeypatch):
+    """5xx is handled by request_with_retry (one authority), so its branch is live: a 503
+    then a 200 sleeps the app-level 5xx backoff (30) and succeeds."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    responses.add(responses.GET, "https://x/foo", status=503)
+    responses.add(responses.GET, "https://x/foo", json={"ok": True}, status=200)
+    assert request_with_retry(make_session(pat="x"), "GET", "https://x/foo").json() == {"ok": True}
+    assert sleeps == [30]
+
+
+@responses.activate
+def test_5xx_honors_capped_retry_after(monkeypatch):
+    """Retry-After is honored AND capped for 5xx too — the same single authority as 429."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    responses.add(responses.GET, "https://x/foo", status=503, headers={"Retry-After": "99999"})
+    responses.add(responses.GET, "https://x/foo", json={"ok": True}, status=200)
+    request_with_retry(make_session(pat="x"), "GET", "https://x/foo")
+    assert sleeps == [_MAX_WAIT_SECONDS]
+
+
+def test_session_blocks_cookies():
+    """PAT auth needs no cookies; blocking them removes the one piece of shared MUTABLE
+    state on the Session, making it safe to share across the fan-out of threads."""
+    sess = make_session(pat="x")
+    assert sess.cookies._policy is _BLOCK_ALL_COOKIES
