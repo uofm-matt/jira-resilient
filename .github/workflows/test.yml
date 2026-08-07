@@ -59,8 +59,8 @@ jobs:
       # coverage improves; never lower them to make a build pass.
       - name: Coverage floors
         run: |
-          coverage report --fail-under=92
-          coverage report --include='*/client.py' --fail-under=89
+          coverage report --fail-under=97
+          coverage report --include='*/client.py' --fail-under=97
           coverage report --include='*/http.py'   --fail-under=94
 
   floor:
