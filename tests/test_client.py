@@ -65,6 +65,8 @@ def _fake_jira_delta_search(base_url, dataset, *, calls=None):
 
 @pytest.fixture
 def client(base_url):
+    # Overrides conftest's tz-pinned client because test_server_tz_uses_probed_offset
+    # asserts the probe's own result; pinning _server_tz would answer it in advance.
     return JiraClient(base_url, pat="test", verify=False)
 
 
@@ -537,9 +539,11 @@ def test_search_seek_all_tiers_fail_raises(client, base_url, monkeypatch):
 
 @responses.activate
 def test_search_seek_hub_tier_tolerates_issuelinks_failure(client, base_url, monkeypatch):
-    """If the per-issue issuelinks fetch fails for ONE issue, hub tier still
-    progresses with `issuelinks=[]` for that issue — better partial data than
-    the whole page failing because one hub couldn't serialize its own links.
+    """If the per-issue issuelinks fetch fails for ONE issue, the hub tier still yields the
+    page — but leaves that issue's `issuelinks` key ABSENT rather than fabricating `[]`.
+
+    An empty list reads as an authoritative "no links" and would let a consumer overwrite
+    real ones. Absence is the per-issue degradation signal.
     """
     import time
 
@@ -1089,8 +1093,9 @@ def test_paging_advances_start_at_by_page_length(
     """`startAt` advances by the rows actually returned, never by the page size asked for.
 
     JIRA is free to answer `maxResults=N` with fewer than N rows; advancing by N would
-    skip every row in the gap. Now that one loop serves all four endpoints, this is the
-    only oracle standing between that mutation and a silent data hole everywhere.
+    skip every row in the gap. One loop serves all four of these endpoints, so this is the
+    oracle for every one of them — but NOT for `search_paged`, which keeps its own copy of
+    the same protocol and is still unpinned against this mutation.
     """
     for page in ([{"id": "1", "key": "XX-1"}], [{"id": "2", "key": "XX-2"}], []):
         responses.add(method, f"{base_url}/rest/api/2{path}", json={key: page})
@@ -1163,3 +1168,25 @@ def test_jira_jql_error_is_exported():
     import jira_resilient
 
     assert jira_resilient.JiraJqlError is not None and "JiraJqlError" in jira_resilient.__all__
+
+
+@responses.activate
+def test_search_paged_advances_start_at_by_page_length(client, base_url):
+    """`search_paged` keeps its own copy of the paging loop — it needs the three-tier fetch
+    and yields envelopes, so it cannot use `_paginate` — and that copy was unpinned.
+
+    JIRA may answer `maxResults=N` with fewer than N rows; advancing by N skips the gap.
+    The `_paginate` version of this test covers four callers and not this one.
+    """
+    pages = [
+        {"issues": [{"id": "1", "key": "XX-1"}], "names": {}, "schema": {}, "total": 2},
+        {"issues": [{"id": "2", "key": "XX-2"}], "names": {}, "schema": {}, "total": 2},
+    ]
+    for p in pages:
+        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=p)
+    got = [
+        i["key"] for page in client.search_paged("project = XX", page_size=2) for i in page.issues
+    ]
+    sent = [json.loads(c.request.body)["startAt"] for c in responses.calls]
+    assert got == ["XX-1", "XX-2"], f"short page skipped rows: {got}"
+    assert sent == [0, 1], f"startAt advanced by page_size, not row count: {sent}"

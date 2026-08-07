@@ -18,25 +18,6 @@ from jira_resilient import JiraClient, JiraFetchError, JiraParseError
 from jira_resilient.exceptions import JiraJqlError
 
 
-@pytest.fixture
-def base_url() -> str:
-    return "https://jira.example.com"
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    import time
-
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-
-
-@pytest.fixture
-def client(base_url):
-    c = JiraClient(base_url, pat="test", verify=False)
-    c._server_tz = UTC
-    return c
-
-
 def _delta(client):
     return list(client.search_seek("PROJ", after_ts=datetime(2026, 5, 18, 10, 0, tzinfo=UTC)))
 
@@ -236,3 +217,62 @@ def test_hub_search_tier_skips_an_issue_without_a_key(client, base_url, no_sleep
     pages = list(client.search_paged("project = PROJ"))
     assert [p.tier for p in pages] == ["hub"]
     assert "fields" not in pages[0].issues[0]
+
+
+# ----- the HTTP boundary: what a 2xx body and a 3xx are allowed to do --------
+
+_NON_OBJECT_BODIES = [[], [{"displayName": "x"}], "login required", 12]
+
+
+@responses.activate
+@pytest.mark.parametrize("body", _NON_OBJECT_BODIES, ids=repr)
+def test_a_non_object_2xx_body_raises_inside_the_family(client, base_url, body):
+    """A 200 that decodes to a list, string or number reaches `.get` and raised
+    `AttributeError` — which is neither a `JiraResilientError` nor a `RequestException`,
+    so it escaped both boundaries the README tells callers to catch.
+
+    An SSO/proxy page and a JSON error envelope both arrive in exactly this shape.
+    """
+    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/comment", json=body)
+    with pytest.raises(JiraParseError):
+        client.get_comments("XX-1")
+
+
+@responses.activate
+@pytest.mark.parametrize("body", _NON_OBJECT_BODIES, ids=repr)
+def test_the_probes_swallow_a_non_object_body_rather_than_raising(client, base_url, body):
+    """The two self-guarding probes promise not to raise, so for them the same body must
+    reach their documented fallback instead of the exception above."""
+    responses.add(responses.GET, f"{base_url}/rest/api/2/myself", json=body)
+    responses.add(responses.GET, f"{base_url}/rest/api/2/serverInfo", json=body)
+    unprobed = JiraClient(base_url, pat="test", verify=False)
+    assert unprobed.is_authenticated is False
+    assert unprobed.server_tz is UTC
+
+
+@responses.activate
+def test_a_redirect_never_becomes_an_authenticated_session_or_a_timezone(client, base_url):
+    """Both probes used `session.get`, which follows redirects — so an SSO 302 made
+    `is_authenticated` True against a login page, and `server_tz` adopt the LOGIN HOST's
+    offset. That offset is rendered into every delta JQL literal, shifting the minute
+    window the scan drains. 0.6.1 fixed this for `list_fields` and left the two probes.
+    """
+    for path in ("myself", "serverInfo"):
+        responses.add(
+            responses.GET,
+            f"{base_url}/rest/api/2/{path}",
+            status=302,
+            headers={"Location": f"https://sso.example.invalid/{path}"},
+        )
+    responses.add(
+        responses.GET, "https://sso.example.invalid/myself", json={"displayName": "SSO Portal"}
+    )
+    responses.add(
+        responses.GET,
+        "https://sso.example.invalid/serverInfo",
+        json={"serverTime": "2026-05-19T13:00:00.000+0530"},
+    )
+    unprobed = JiraClient(base_url, pat="test", verify=False)
+    assert unprobed.is_authenticated is False
+    assert unprobed.server_tz is UTC
+    assert not any("sso.example.invalid" in c.request.url for c in responses.calls)
