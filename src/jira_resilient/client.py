@@ -750,7 +750,15 @@ class JiraClient:
                 tier=tier,
                 fallback=fallback,
             )
-            after_id = int(issues[-1]["id"])
+            try:
+                after_id = int(issues[-1]["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                # Same contract as the delta drain below: the cursor is derived from this
+                # field, so a row without a usable id ends the scan, and it must end it as
+                # a JiraResilientError like every other malformed-payload failure.
+                raise JiraParseError(
+                    f"Full-scan page ended with row missing/invalid id: {issues[-1]!r}"
+                ) from exc
 
     def _search_by_updated(
         self,

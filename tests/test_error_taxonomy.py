@@ -37,7 +37,7 @@ def client(base_url):
     return c
 
 
-def _delta(client, base_url, minute="2026-05-18T10:00:00.000+0000"):
+def _delta(client):
     return list(client.search_seek("PROJ", after_ts=datetime(2026, 5, 18, 10, 0, tzinfo=UTC)))
 
 
@@ -75,7 +75,7 @@ def test_next_minute_probe_400_raises_jql_error(client, base_url):
         json={"errorMessages": ["Field 'nope' does not exist"]},
     )
     with pytest.raises(JiraJqlError) as ei:
-        _delta(client, base_url)
+        _delta(client)
     assert ei.value.error_messages == ["Field 'nope' does not exist"]
 
 
@@ -86,7 +86,7 @@ def test_next_minute_probe_non_400_raises_fetch_error(client, base_url):
     responses.add(responses.POST, f"{base_url}/rest/api/2/search", json={"issues": []})
     responses.add(responses.POST, f"{base_url}/rest/api/2/search", status=404)
     with pytest.raises(JiraFetchError):
-        _delta(client, base_url)
+        _delta(client)
 
 
 @responses.activate
@@ -98,7 +98,7 @@ def test_next_minute_probe_row_without_updated_raises_parse_error(client, base_u
         json={"issues": [{"id": "1", "fields": {}}]},
     )
     with pytest.raises(JiraParseError):
-        _delta(client, base_url)
+        _delta(client)
 
 
 @responses.activate
@@ -112,7 +112,7 @@ def test_next_minute_probe_unparseable_updated_raises_parse_error(client, base_u
         json={"issues": [{"id": "1", "fields": {"updated": "last tuesday"}}]},
     )
     with pytest.raises(JiraParseError):
-        _delta(client, base_url)
+        _delta(client)
 
 
 @responses.activate
