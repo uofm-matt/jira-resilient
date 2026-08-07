@@ -114,8 +114,9 @@ def make_session(
     through this session (e.g. a thread pool issuing N parallel GETs) — otherwise urllib3
     caps live connections at 10 and discards/reopens the surplus ("Connection pool is full").
 
-    The session blocks cookies (PAT auth needs none), so its only shared state is read-only
-    and it is safe to share across threads.
+    The session blocks cookies (PAT auth needs none), so the session itself holds no mutable
+    state for concurrent callers to race. That is a claim about the session only — see
+    `JiraClient` for what sharing a whole client across threads does and does not cover.
     """
     session = requests.Session()
     if pat:

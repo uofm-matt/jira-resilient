@@ -95,16 +95,13 @@ _MINIMAL_FIELDS_LIST = _MINIMAL_FIELDS.split(",")
 class JiraClient:
     """Resilient JIRA Server REST client with seek pagination and reindex-aware recovery.
 
-    Example (illustrative only — see tests/ for live-network-free executable examples)::
+    Construction opens no connection, so the full signature is checkable offline:
 
-        from jira_resilient import JiraClient
+        >>> client = JiraClient("https://jira.example.com/", "token", timeout=60, pool_maxsize=32)
+        >>> client.base_url, client.timeout, client.max_attempts
+        ('https://jira.example.com', 60, 5)
 
-        client = JiraClient("https://jira.example.com", pat="...")
-        if not client.is_authenticated:
-            raise SystemExit("auth failed")
-        for page in client.search_seek("PROJ"):
-            for issue in page.issues:
-                ...
+    Every other method is network-bound; see tests/ for executable examples of those.
     """
 
     def __init__(
@@ -135,7 +132,13 @@ class JiraClient:
 
     @property
     def is_authenticated(self) -> bool:
-        """Probe `/rest/api/2/myself`. True iff HTTP 200. Logs the displayName on success."""
+        """Probe `/rest/api/2/myself`. True iff HTTP 200 with a JSON body.
+
+        A property that issues a request on EVERY access — nothing is cached. Bind it once
+        (`ok = client.is_authenticated`) instead of testing it per loop iteration. Never
+        raises: a 401, a network error, and an SSO login page served as 200 HTML all log and
+        return False. Logs the displayName on success.
+        """
         try:
             resp = self.session.get(f"{self.base_url}/rest/api/2/myself", timeout=30)
         except requests.RequestException as exc:
@@ -163,6 +166,12 @@ class JiraClient:
 
         Falls back to UTC if `serverTime` can't be parsed — at worst that's the same
         broken behavior callers had pre-fix.
+
+        Cached for the life of the client as a FIXED OFFSET (what `serverTime`'s suffix
+        carries), not a DST-aware zone, so a client held across a daylight-saving transition
+        keeps rendering literals at the offset it captured. Rebuild the client after one.
+        The lazy init is deliberately unlocked: racing threads each probe once and converge
+        on the same offset, and a lock on every access would cost more than the stray GET.
         """
         if self._server_tz is None:
             try:
@@ -262,7 +271,16 @@ class JiraClient:
         """
         if self._changelog_paginated:
             try:
-                return self._changelog_paged(key, page_size)
+                return list(
+                    self._paginate(
+                        "GET",
+                        f"{self.base_url}/rest/api/2/issue/{key}/changelog",
+                        "values",
+                        page_size=page_size,
+                        timeout=60,
+                        max_attempts=3,
+                    )
+                )
             except requests.exceptions.HTTPError as exc:
                 if exc.response is None or exc.response.status_code != 404:
                     raise
@@ -286,26 +304,55 @@ class JiraClient:
             raise
         return True
 
-    def _changelog_paged(self, key: str, page_size: int) -> list[dict[str, Any]]:
-        url = f"{self.base_url}/rest/api/2/issue/{key}/changelog"
-        histories: list[dict[str, Any]] = []
+    def _paginate(
+        self,
+        method: str,
+        url: str,
+        envelope_key: str,
+        *,
+        page_size: int,
+        timeout: int,
+        max_attempts: int,
+        body: dict[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """The `startAt`/`total` offset loop every JIRA collection sub-resource shares.
+
+        `envelope_key` names the array in the response envelope (`values` / `worklogs` /
+        `comments` / `issues`). `body` set routes the paging keys into a JSON body
+        (`POST /search`); unset puts them in the query string — JIRA has no
+        GET-with-body, so the transport follows from the method.
+
+        A generator, so a caller's per-item work (list_keys' `i["key"]`) raises on the
+        page that carries the bad row instead of after the whole scan. Every caller must
+        therefore MATERIALIZE it before returning: `get_changelog` calls this inside a
+        `try` that maps a 404 onto a one-way route flip, and returning the bare generator
+        would let that 404 escape the handler on first iteration instead.
+
+        The exit condition carries two independent guarantees. An ABSENT `total` means
+        "keep paging" — JIRA variants omit it, and reading absent as 0 silently truncates
+        every caller to one page. An empty page ends the scan, and is the ONLY exit when
+        `total` is absent. `start_at` advances by the page's real length, never by
+        `page_size`: a server free to return fewer rows than asked would otherwise leave
+        a hole at every short page.
+        """
         start_at = 0
         while True:
+            paging = {"startAt": start_at, "maxResults": page_size}
             data = request_with_retry(
                 self.session,
-                "GET",
+                method,
                 url,
-                params={"startAt": start_at, "maxResults": page_size},
-                timeout=60,
-                max_attempts=3,
+                params=paging if body is None else None,
+                json=None if body is None else body | paging,
+                timeout=timeout,
+                max_attempts=max_attempts,
             ).json()
-            page = data.get("values") or []
-            histories.extend(page)
+            page = data.get(envelope_key) or []
+            yield from page
             start_at += len(page)
             total = data.get("total")
             if not page or (total is not None and start_at >= total):
-                break
-        return histories
+                return
 
     def _changelog_expand(self, key: str) -> list[dict[str, Any]]:
         """JIRA Server changelog: the issue resource with `expand=changelog`. Returns
@@ -328,25 +375,16 @@ class JiraClient:
         fetches the complete history for issues where the inline response was
         truncated (`fields.worklog.total > len(fields.worklog.worklogs)`).
         """
-        url = f"{self.base_url}/rest/api/2/issue/{key}/worklog"
-        worklogs: list[dict[str, Any]] = []
-        start_at = 0
-        while True:
-            data = request_with_retry(
-                self.session,
+        return list(
+            self._paginate(
                 "GET",
-                url,
-                params={"startAt": start_at, "maxResults": page_size},
+                f"{self.base_url}/rest/api/2/issue/{key}/worklog",
+                "worklogs",
+                page_size=page_size,
                 timeout=60,
                 max_attempts=3,
-            ).json()
-            page = data.get("worklogs") or []
-            worklogs.extend(page)
-            start_at += len(page)
-            total = data.get("total")
-            if not page or (total is not None and start_at >= total):
-                break
-        return worklogs
+            )
+        )
 
     def get_comments(self, key: str, *, page_size: int = 50) -> list[dict[str, Any]]:
         """Full comment list via paginated `/rest/api/2/issue/{key}/comment`.
@@ -356,25 +394,16 @@ class JiraClient:
         to 10 on older JIRA Server versions). Use when
         `fields.comment.total > len(fields.comment.comments)`.
         """
-        url = f"{self.base_url}/rest/api/2/issue/{key}/comment"
-        comments: list[dict[str, Any]] = []
-        start_at = 0
-        while True:
-            data = request_with_retry(
-                self.session,
+        return list(
+            self._paginate(
                 "GET",
-                url,
-                params={"startAt": start_at, "maxResults": page_size},
+                f"{self.base_url}/rest/api/2/issue/{key}/comment",
+                "comments",
+                page_size=page_size,
                 timeout=60,
                 max_attempts=3,
-            ).json()
-            page = data.get("comments") or []
-            comments.extend(page)
-            start_at += len(page)
-            total = data.get("total")
-            if not page or (total is not None and start_at >= total):
-                break
-        return comments
+            )
+        )
 
     def get_remote_links(self, key: str) -> list[dict[str, Any]]:
         """All remote links for an issue via `/rest/api/2/issue/{key}/remotelink`.
@@ -602,46 +631,46 @@ class JiraClient:
     # ----- field catalog ------------------------------------------------------
 
     def list_fields(self) -> list[dict[str, Any]]:
-        """`GET /rest/api/2/field`. Raises `requests.RequestException` on a failed request,
-        or `JiraParseError` if a 200 body is not JSON (SSO/proxy HTML)."""
+        """`GET /rest/api/2/field` — the full field catalog.
+
+        Goes through `request_with_retry` like every other read, so it gets the one
+        retry/redirect policy: `JiraAuthError` on 401/403, capped Retry-After backoff on
+        429/5xx, and ANY 3xx surfaced rather than followed. The budget is the small-read
+        one (30s, 3 attempts) rather than the client-wide one, so a hard-down server costs
+        two backoff sleeps: 90s for a bare 5xx, 180s for a bare 429, and up to twice
+        `_MAX_WAIT_SECONDS` if the server sends a large `Retry-After` (it is honored up to
+        that cap, so a hostile header cannot park a worker indefinitely but can still hold
+        one for a while).
+
+        Raises `JiraParseError` if a 200 body is not a JSON list: an SSO/proxy HTML page,
+        or a JSON error envelope, would otherwise be returned AS the catalog.
+        """
         url = f"{self.base_url}/rest/api/2/field"
-        resp = self.session.get(url, timeout=30)
-        resp.raise_for_status()
+        resp = request_with_retry(self.session, "GET", url, timeout=30, max_attempts=3)
         try:
-            fields: list[dict[str, Any]] = resp.json()
+            fields = resp.json()
         except ValueError as exc:
             raise JiraParseError(f"list_fields: 200 but non-JSON body from {url}") from exc
+        if not isinstance(fields, list):
+            raise JiraParseError(f"list_fields: 200 but a non-list body from {url}: {fields!r}")
         return fields
 
     # ----- listings -----------------------------------------------------------
 
     def list_keys(self, jql: str) -> list[str]:
         """All matching keys via `fields=key`. Tiny payload, never times out."""
-        url = f"{self.base_url}/rest/api/2/search"
-        keys: list[str] = []
-        start_at = 0
-        while True:
-            body = {
-                "jql": jql,
-                "startAt": start_at,
-                "maxResults": _LIST_KEYS_PAGE_SIZE,
-                "fields": ["key"],
-            }
-            data = request_with_retry(
-                self.session,
+        return [
+            i["key"]
+            for i in self._paginate(
                 "POST",
-                url,
-                json=body,
+                f"{self.base_url}/rest/api/2/search",
+                "issues",
+                page_size=_LIST_KEYS_PAGE_SIZE,
                 timeout=self.timeout,
                 max_attempts=self.max_attempts,
-            ).json()
-            page = [i["key"] for i in data.get("issues", [])]
-            keys.extend(page)
-            start_at += len(page)
-            total = data.get("total")
-            if not page or (total is not None and start_at >= total):
-                break
-        return keys
+                body={"jql": jql, "fields": ["key"]},
+            )
+        ]
 
     # ----- pagination ---------------------------------------------------------
 
@@ -750,7 +779,15 @@ class JiraClient:
                 tier=tier,
                 fallback=fallback,
             )
-            after_id = int(issues[-1]["id"])
+            try:
+                after_id = int(issues[-1]["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                # Same contract as the delta drain below: the cursor is derived from this
+                # field, so a row without a usable id ends the scan, and it must end it as
+                # a JiraResilientError like every other malformed-payload failure.
+                raise JiraParseError(
+                    f"Full-scan page ended with row missing/invalid id: {issues[-1]!r}"
+                ) from exc
 
     def _search_by_updated(
         self,

@@ -2,6 +2,54 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.1] — 2026-08-07
+
+Cleanup and contract-fidelity release. No change to the seek paginator or the tiered fetch.
+
+### Added
+
+- **Python 3.11 is supported and tested.** The previous `>=3.12` floor was arbitrary — the
+  source contains no 3.12-only syntax. 3.11 is the real floor, and the binding constraint is
+  `datetime.fromisoformat`, not `datetime.UTC`: 3.11 rewrote it to accept general ISO-8601, and
+  3.10 rejects every timestamp shape JIRA Server emits (`...+0000`, `...-0600`, `...Z`). 3.10
+  would need a hand-rolled parser, and without one `server_tz` silently falls back to UTC on
+  every non-UTC server — so support stops at 3.11.
+
+### Fixed
+
+- **`list_fields` now uses the same HTTP policy as every other read.** It called
+  `session.get` directly, so a 401 raised raw `requests.HTTPError` instead of `JiraAuthError`,
+  a 503 got one attempt with no retry, and a redirect was followed — including a cross-host
+  SSO 302, whose login-page JSON was then returned *as the field catalog*. A caller wrapping a
+  run in `except JiraResilientError` did not catch an auth failure here.
+- **A malformed row now fails the same way in both `search_seek` branches.** The delta path has
+  raised `JiraParseError` since 0.5.0; the full scan — the default branch — let a bare
+  `KeyError`, `ValueError`, or `TypeError` escape, none of which is a `JiraResilientError`.
+
+### Changed
+
+- `list_fields` raises `JiraParseError` when a 200 body is not a JSON list, rather than
+  returning it. Any 3xx is now surfaced rather than followed, including a benign 301 from
+  context-path normalization that previously worked.
+- `list_keys` returns `[]` for the malformed body `{"issues": null}` where it previously raised
+  `TypeError`. No JIRA build emits that shape, but this is a loud failure becoming a quiet one
+  and is recorded as such rather than as tolerance.
+- `list_keys` still raises a bare `KeyError` if `/search` returns a row without `key`. Same
+  class as the cursor fix above; deferred rather than overlooked.
+
+### Internal
+
+- The `startAt`/`total` paging loop is now written once instead of four times. Behavior verified
+  unchanged by a request-level differential (4 methods × 18 scenarios × 2 page sizes) rather
+  than by the tests passing — a mutation audit found three defects the four-copy version could
+  not detect at all, including one that ships GETs with a JSON body and no query string.
+- The error taxonomy's failure branches have oracles: all four `_probe_next_minute` paths and
+  every non-404 re-raise. Coverage 92% → 99%, floors ratcheted to match.
+- Documentation truth pass. `pool_maxsize` documented (missing since 0.4.4), thread safety
+  scoped precisely, `server_tz` documented as caching a fixed offset rather than a DST-aware
+  zone, `is_authenticated` documented as performing a request per access. Unverifiable claims
+  removed. `tests/test_docs.py` turns the mechanical claims into oracles.
+
 ## [0.6.0] — 2026-08-06
 
 A data-integrity release. **If you have ever passed `extra_filter` containing a top-level `OR`,

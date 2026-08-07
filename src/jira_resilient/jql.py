@@ -64,6 +64,8 @@ def build_jql(
     'project = "PROJ" ORDER BY updated ASC'
     >>> build_jql("PROJ", updated_after="2026-05-18T07:30:00")
     'project = "PROJ" AND updated >= "2026-05-18 07:30" ORDER BY updated ASC'
+    >>> build_jql("PROJ", extra_filter='status = "Done" OR labels = "nightly"')
+    'project = "PROJ" AND (status = "Done" OR labels = "nightly") ORDER BY updated ASC'
     """
     _check_project_key(project_key)
     base = f'project = "{project_key}"'
