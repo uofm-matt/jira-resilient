@@ -23,7 +23,7 @@ import jql_model
 import pytest
 import responses
 
-from jira_resilient import JiraClient, build_jql
+from jira_resilient import build_jql
 
 # Out-of-project rows carry LOW ids on purpose: under `ORDER BY id ASC` they sort first, so a
 # query whose project clause has stopped binding will re-serve them as page one forever.
@@ -93,13 +93,6 @@ def _register(base_url, counter, *, stale_updated=None):
         callback=_callback,
         content_type="application/json",
     )
-
-
-@pytest.fixture
-def client(base_url):
-    c = JiraClient(base_url, pat="test", verify=False)
-    c._server_tz = UTC  # skip the /serverInfo probe; JQL literals are already UTC here
-    return c
 
 
 def _keys(pages):

@@ -15,12 +15,10 @@ failure mode this audit exists to find, so the first test guards the enumerator 
 from __future__ import annotations
 
 import inspect
-from datetime import UTC
 
 import pytest
 
 from jira_resilient import (
-    JiraClient,
     JiraResilientError,
     exceptions,
 )
@@ -40,13 +38,6 @@ DOCUMENTED = {
     "JiraQueryValidationError",
     "JiraResilientError",
 }
-
-
-@pytest.fixture
-def client(base_url):
-    c = JiraClient(base_url, pat="test", verify=False)
-    c._server_tz = UTC  # skip the /serverInfo probe
-    return c
 
 
 def test_the_family_enumeration_finds_every_documented_exception():

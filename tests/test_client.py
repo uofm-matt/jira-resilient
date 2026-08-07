@@ -65,6 +65,8 @@ def _fake_jira_delta_search(base_url, dataset, *, calls=None):
 
 @pytest.fixture
 def client(base_url):
+    # Overrides conftest's tz-pinned client because test_server_tz_uses_probed_offset
+    # asserts the probe's own result; pinning _server_tz would answer it in advance.
     return JiraClient(base_url, pat="test", verify=False)
 
 

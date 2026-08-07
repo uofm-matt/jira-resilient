@@ -14,27 +14,8 @@ import pytest
 import requests
 import responses
 
-from jira_resilient import JiraClient, JiraFetchError, JiraParseError
+from jira_resilient import JiraFetchError, JiraParseError
 from jira_resilient.exceptions import JiraJqlError
-
-
-@pytest.fixture
-def base_url() -> str:
-    return "https://jira.example.com"
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    import time
-
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-
-
-@pytest.fixture
-def client(base_url):
-    c = JiraClient(base_url, pat="test", verify=False)
-    c._server_tz = UTC
-    return c
 
 
 def _delta(client):

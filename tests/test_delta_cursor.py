@@ -20,18 +20,8 @@ import json
 import re
 from datetime import UTC, datetime
 
-import pytest
 import responses
 from test_client import _fake_jira_delta_search
-
-from jira_resilient import JiraClient
-
-
-@pytest.fixture
-def client(base_url):
-    c = JiraClient(base_url, pat="test", verify=False)
-    c._server_tz = UTC  # skip the /serverInfo probe; JQL literals are already UTC here
-    return c
 
 
 @responses.activate

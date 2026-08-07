@@ -17,16 +17,12 @@ a legitimate change; asking for everything at the tier whose job is to ask for l
 from __future__ import annotations
 
 import json
-import time
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import pytest
 import requests
 import responses
-
-from jira_resilient import JiraClient
 
 # What a degraded tier exists to avoid sending: `*all` pulls every custom field, and each named
 # field is on its own big enough to blow the timeout on a pathological issue.
@@ -38,18 +34,6 @@ _CORE = {"summary", "status", "updated"}
 
 # Timed-out attempts before the tier under test gets its turn: 2 per tier, `fast_fail`'s budget.
 _TIMEOUTS_BEFORE = {"hub": 2, "minimal": 4}
-
-
-@pytest.fixture
-def client(base_url):
-    c = JiraClient(base_url, pat="test", verify=False)
-    c._server_tz = UTC  # skip the /serverInfo probe
-    return c
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    monkeypatch.setattr(time, "sleep", lambda _: None)
 
 
 def _tokens(spec: str | list[str]) -> set[str]:

@@ -5,17 +5,7 @@ from __future__ import annotations
 import pytest
 import responses
 
-from jira_resilient import JiraClient, JiraParseError
-
-
-@pytest.fixture
-def base_url() -> str:
-    return "https://jira.example.com"
-
-
-@pytest.fixture
-def client(base_url):
-    return JiraClient(base_url, pat="test", verify=False)
+from jira_resilient import JiraParseError
 
 
 @pytest.mark.parametrize("row", [{"key": "P-1"}, {"id": "abc"}, {"id": None}])

@@ -8,19 +8,8 @@ import pytest
 import requests
 import responses
 
-from jira_resilient import JiraClient, JiraParseError
+from jira_resilient import JiraParseError
 from jira_resilient.exceptions import JiraAuthError
-
-
-@pytest.fixture
-def base_url() -> str:
-    return "https://jira.example.com"
-
-
-@pytest.fixture
-def client(base_url):
-    return JiraClient(base_url, pat="test", verify=False)
-
 
 # ----- list_fields goes through the hardened HTTP path ---------------------
 
