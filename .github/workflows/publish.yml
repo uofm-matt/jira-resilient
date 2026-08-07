@@ -2,46 +2,73 @@ name: publish
 
 on:
   push:
-    tags: ["v*"]
+    # Note: only numeric tags. Non-release `v*-locked-*` style tags used to match here and
+    # would have started a publish run.
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: read
 
 jobs:
-  publish:
+  # A tag push matches no branch filter, so before this line publish.yml was the entire
+  # release gate: pytest + ruff check on 3.12, no 3.13/3.14, no format check, no artifact
+  # inspection. Reusing test.yml means a release can never be gated more weakly than main.
+  gate:
+    uses: ./.github/workflows/test.yml
+
+  verify-tag:
+    needs: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Tag matches the version that was actually built
+        run: |
+          BUILT="${{ needs.gate.outputs.version }}"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$BUILT" != "$TAG" ]; then
+            echo "::error::built version $BUILT != tag $TAG"; exit 1
+          fi
+
+  publish:
+    needs: [gate, verify-tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Configure PyPI trusted publishing for this project, environment "pypi":
     # https://docs.pypi.org/trusted-publishers/
     environment: pypi
     permissions:
-      id-token: write    # required for trusted publishing
-      contents: write    # required for `gh release create`
+      id-token: write
+    steps:
+      # The bytes that were built, inspected and smoke-tested are the bytes that ship.
+      # Nothing is rebuilt here.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Without this, a re-run after a post-upload failure dies on the duplicate and
+          # the GitHub Release below never gets created.
+          skip-existing: true
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-      # Gate the release: tests + lint must pass and the tag must match the package version,
-      # so a broken or mis-tagged build can never reach PyPI.
-      - run: pip install -e ".[dev]"
-      - run: pytest -q
-      - run: ruff check src tests
-      - name: Tag matches package version
-        run: |
-          PKG_VERSION="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::pyproject version $PKG_VERSION != tag $TAG_VERSION"; exit 1
-          fi
-      - run: pip install build
-      - run: python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
-
-      # Extract the changelog entry for this tag and create a GitHub Release.
-      # Print lines between the `## [X.Y.Z]` header and the next `## [` header
-      # (exclusive). The header is matched as a LITERAL prefix via index(), not a
-      # regex — `## [X.Y.Z]` as a regex treats `[`/`]`/`.` as metacharacters and
-      # never matches, which silently stubbed every release's notes. Falls back to
-      # a pointer if the section isn't found.
+          name: dist
+          path: dist
+      # Print lines between the `## [X.Y.Z]` header and the next `## [` header (exclusive).
+      # The header is matched as a LITERAL prefix via index(), not a regex — `## [X.Y.Z]` as
+      # a regex treats `[`/`]`/`.` as metacharacters and never matches, which silently
+      # stubbed every release's notes. Note this also means a CHANGELOG heading that is not
+      # bracketed will not reset `flag`, so keep every section header in `## [...]` form.
       - name: Extract release notes from CHANGELOG
-        id: notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           awk -v ver="## [$VERSION]" '
@@ -49,17 +76,14 @@ jobs:
             /^## \[/ {flag=0}
             flag {print}
           ' CHANGELOG.md > /tmp/release_notes.md
-          # If CHANGELOG didn't yield anything, fall back to a stub.
           if [ ! -s /tmp/release_notes.md ]; then
             echo "Release $GITHUB_REF_NAME — see CHANGELOG.md for details." > /tmp/release_notes.md
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Tolerant of a re-run: create, or update the release that a prior attempt left.
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file /tmp/release_notes.md \
-            --latest
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release_notes.md --latest dist/* \
+          || gh release edit "$GITHUB_REF_NAME" --notes-file /tmp/release_notes.md --latest

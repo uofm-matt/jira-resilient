@@ -17,8 +17,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
@@ -26,10 +28,13 @@ dependencies = ["requests>=2.31", "urllib3>=2"]
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2",
     "pytest>=8",
-    "pytest-cov>=4",
+    "pytest-cov>=5",
+    "pytest-timeout>=2.3",
     "responses>=0.25",
     "ruff>=0.6",
+    "twine>=5",
 ]
 
 [project.urls]
@@ -63,4 +68,22 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests", "src/jira_resilient"]
 addopts = "--doctest-modules"
+# Without this, a missing pytest-timeout turns the `timeout` key below into an unknown-config
+# warning, which filterwarnings promotes to an INTERNALERROR. This makes it a clear message.
+required_plugins = ["pytest-timeout"]
 filterwarnings = ["error"]
+# A dropped loop-exit condition must FAIL the suite, not hang it — client.py pages with
+# `while True`, and a mutation test confirmed the suite otherwise runs until killed. The
+# slowest test today is under 0.005s, so 15s is a ~3000x margin. Override a genuinely slow
+# test with @pytest.mark.timeout(n) rather than raising this.
+timeout = 15
+
+[tool.coverage.run]
+branch = true
+source = ["jira_resilient"]
+
+[tool.coverage.report]
+show_missing = true
+# Replaces coverage.py's default exclude list, which honors `# pragma: no cover`. This repo
+# has zero suppressions of any kind; keeping the list empty enforces that by construction.
+exclude_lines = []

@@ -5,14 +5,43 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Called by publish.yml. The release gate IS this workflow — there is no weaker path.
+  # Before this, a tag push matched no branch filter, so publish.yml gated releases by
+  # itself on pytest + ruff check on 3.12 alone.
+  workflow_call:
+    outputs:
+      version:
+        description: Version of the distribution that was actually built.
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +49,112 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: pip install -e ".[dev]"
+      # Per-test timeout comes from [tool.pytest.ini_options].timeout, so a dropped loop-exit
+      # condition fails in 15s instead of running until the job is killed.
+      - run: pytest -q --cov --cov-report=term-missing
+      # Ratchets set at the numbers measured when they were introduced. Raise them as
+      # coverage improves; never lower them to make a build pass.
+      - name: Coverage floors
+        run: |
+          coverage report --fail-under=92
+          coverage report --include='*/client.py' --fail-under=89
+          coverage report --include='*/http.py'   --fail-under=94
+
+  floor:
+    # `requests>=2.31` / `urllib3>=2` is a promise to users. Every other job installs
+    # whatever pip resolves today, so nothing else in CI can keep that promise honest.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv
+      # lowest-direct on the runtime deps only: applied to the dev extra it resolves
+      # pytest 8.0, which pytest-timeout cannot register against.
+      - run: uv pip install --system --resolution lowest-direct .
+      - run: uv pip install --system "pytest>=8" pytest-cov pytest-timeout responses
+      - run: python -c "import requests, urllib3; print(requests.__version__, urllib3.__version__)"
       - run: pytest -q
-      - run: ruff check src tests
-      - run: ruff format --check src tests
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - name: Reject stray files in the sdist
+        # Third layer behind .gitignore and the hatch allowlist. A config someone edits
+        # later cannot silently re-open the leak that put .python-version and a private
+        # planning document into the 0.5.0-era sdist.
+        run: |
+          python - <<'PY'
+          import glob, sys, tarfile
+          allowed = {"PKG-INFO", "pyproject.toml", "README.md", "CHANGELOG.md",
+                     "LICENSE", ".gitignore"}
+          prefixes = ("src/", "tests/")
+          with tarfile.open(glob.glob("dist/*.tar.gz")[0]) as tf:
+              names = [n.split("/", 1)[1] for n in tf.getnames() if "/" in n]
+          bad = [n for n in names if n and n not in allowed and not n.startswith(prefixes)]
+          if bad:
+              sys.exit("sdist contains unexpected files: " + ", ".join(sorted(bad)))
+          print("sdist contents OK")
+          PY
+      - id: meta
+        name: Built filename matches the declared version
+        run: |
+          VERSION="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          test -f "dist/jira_resilient-$VERSION-py3-none-any.whl" \
+            || { echo "::error::no wheel named for pyproject version $VERSION"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    # CI has only ever exercised `pip install -e .`, which cannot catch a module missing
+    # from the wheel, a lost py.typed, or an import that works only from the source tree.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      # Deliberately NO checkout: the source tree must not be on sys.path.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Install the built wheel and use it
+        run: |
+          pip install dist/*.whl
+          python - <<'PY'
+          import importlib.metadata as md, pathlib
+          import jira_resilient as jr
+          from jira_resilient import JiraClient
+          assert jr.__version__ == md.version("jira-resilient"), (jr.__version__, md.version("jira-resilient"))
+          assert (pathlib.Path(jr.__file__).parent / "py.typed").is_file(), "py.typed missing from wheel"
+          assert JiraClient("https://example.invalid", "t") is not None
+          print("wheel smoke OK", jr.__version__)
+          PY
+      - name: Install from the sdist (proves it still builds)
+        if: matrix.python-version == '3.12'
+        run: |
+          pip uninstall -y jira-resilient
+          pip install --no-binary :all: dist/*.tar.gz
+          python -c "import jira_resilient as j; print('sdist smoke OK', j.__version__)"

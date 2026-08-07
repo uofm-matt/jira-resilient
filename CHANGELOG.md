@@ -86,7 +86,29 @@ Three failure modes, two of which look like success:
 
 - `.python-version` and the local planning doc are gitignored, and the sdist now uses an explicit
   allowlist. Hatchling excludes gitignored files but **not** untracked ones, so both would otherwise
-  have shipped to PyPI in the next release.
+  have shipped to PyPI in the next release. CI re-checks the sdist contents so a later config edit
+  cannot silently re-open the leak.
+- Python 3.14 is now tested and declared. `requires-python` already permitted it.
+
+### Gate (no runtime effect)
+
+- **A dropped loop-exit condition now fails the suite instead of hanging it.** `client.py` pages
+  with `while True`, and mutating the `not page` half of the termination guard made the suite run
+  until killed rather than report a failure. `pytest-timeout` with a 15s per-test bound converts
+  that into a normal failure; `required_plugins` makes the plugin's absence a clear error rather
+  than an internal one.
+- **All four copies of the paging loop now have an oracle.** Only `get_worklogs` had one, so
+  mutating the same guard in `get_changelog`, `get_comments`, or `list_keys` left the suite green.
+  Verified: each of the four mutants is now caught.
+- **The release path is no longer weaker than `main`.** A tag push matches no branch filter, so
+  `publish.yml` alone gated releases — pytest and `ruff check` on 3.12, nothing else. It now calls
+  `test.yml`, which adds 3.13/3.14, the format check, coverage floors, a lowest-direct dependency
+  floor job, `twine check`, and a wheel/sdist install smoke test run without the source tree on
+  `sys.path`. The artifact that is inspected is the artifact that ships.
+- Publishing is now re-runnable: `skip-existing` on the upload, and release creation falls back to
+  editing, so a failure after a successful upload no longer strands the release permanently.
+- The publish trigger is `v[0-9]*`. Non-release tags such as `v1-locked-…` matched `v*` and would
+  have started a publish run.
 
 ## [0.5.0] — 2026-06-20
 
