@@ -602,15 +602,28 @@ class JiraClient:
     # ----- field catalog ------------------------------------------------------
 
     def list_fields(self) -> list[dict[str, Any]]:
-        """`GET /rest/api/2/field`. Raises `requests.RequestException` on a failed request,
-        or `JiraParseError` if a 200 body is not JSON (SSO/proxy HTML)."""
+        """`GET /rest/api/2/field` — the full field catalog.
+
+        Goes through `request_with_retry` like every other read, so it gets the one
+        retry/redirect policy: `JiraAuthError` on 401/403, capped Retry-After backoff on
+        429/5xx, and ANY 3xx surfaced rather than followed. The budget is the small-read
+        one (30s, 3 attempts) rather than the client-wide one, so a hard-down server costs
+        two backoff sleeps: 90s for a bare 5xx, 180s for a bare 429, and up to twice
+        `_MAX_WAIT_SECONDS` if the server sends a large `Retry-After` (it is honored up to
+        that cap, so a hostile header cannot park a worker indefinitely but can still hold
+        one for a while).
+
+        Raises `JiraParseError` if a 200 body is not a JSON list: an SSO/proxy HTML page,
+        or a JSON error envelope, would otherwise be returned AS the catalog.
+        """
         url = f"{self.base_url}/rest/api/2/field"
-        resp = self.session.get(url, timeout=30)
-        resp.raise_for_status()
+        resp = request_with_retry(self.session, "GET", url, timeout=30, max_attempts=3)
         try:
-            fields: list[dict[str, Any]] = resp.json()
+            fields = resp.json()
         except ValueError as exc:
             raise JiraParseError(f"list_fields: 200 but non-JSON body from {url}") from exc
+        if not isinstance(fields, list):
+            raise JiraParseError(f"list_fields: 200 but a non-list body from {url}: {fields!r}")
         return fields
 
     # ----- listings -----------------------------------------------------------
