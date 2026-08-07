@@ -29,6 +29,7 @@ dependencies = ["requests>=2.31", "urllib3>=2"]
 [project.optional-dependencies]
 dev = [
     "build>=1.2",
+    "mypy>=1.11",
     "pytest>=8",
     "pytest-cov>=5",
     "pytest-timeout>=2.3",
@@ -64,6 +65,17 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "C4", "SIM", "RET", "UP", "RUF"]
 ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+strict = true
+pretty = true
+# No types-requests: requests ships its own py.typed, and the stub widens
+# HTTPError.response to `Response | Any`, which hides a real Optional access.
+# `src` only — tests/ has no __init__.py, so mypy names its modules `test_client`/`conftest`
+# and a `tests.*` override cannot match them. Annotating 1700 lines of pytest functions has
+# near-zero defect yield.
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "src/jira_resilient"]

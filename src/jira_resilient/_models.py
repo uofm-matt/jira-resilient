@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 Tier = Literal["full", "hub", "minimal"]
 
@@ -28,9 +28,9 @@ class SearchPage(NamedTuple):
     fallback re-scans the whole project, which is wasteful for a delta.
     """
 
-    issues: list[dict]
+    issues: list[dict[str, Any]]
     names: dict[str, str]
-    schema: dict[str, dict]
+    schema: dict[str, dict[str, Any]]
     tier: Tier = "full"
     fallback: bool = False
 
@@ -46,5 +46,5 @@ class ResilientFetchResult(NamedTuple):
         - "minimal" — minimal field set (description + custom_fields lost)
     """
 
-    issue: dict
+    issue: dict[str, Any]
     tier: Tier

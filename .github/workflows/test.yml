@@ -34,6 +34,9 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check src tests
       - run: ruff format --check src tests
+      # py.typed tells every downstream checker to trust these annotations. Nothing
+      # verified them until now; --strict is what the strictest consumer runs.
+      - run: mypy
 
   test:
     runs-on: ubuntu-latest

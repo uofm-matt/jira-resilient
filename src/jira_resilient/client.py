@@ -13,7 +13,7 @@ import logging
 import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, tzinfo
-from typing import Any, TypeGuard
+from typing import Any, TypedDict, TypeGuard
 from urllib.parse import quote
 
 import requests
@@ -28,6 +28,16 @@ from jira_resilient.jql import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _FastFail(TypedDict):
+    """The tier-1 request budget, defined once. A plain dict of these two keys cannot be
+    `**`-unpacked under a type checker: unpacking `dict[str, int]` requires the value type to
+    satisfy every remaining parameter, including `fields: str`. A TypedDict maps key by key."""
+
+    timeout: int
+    max_attempts: int
+
 
 _LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for many
 _SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
@@ -64,8 +74,11 @@ def _is_client_error(exc: BaseException) -> bool:
 def _jql_error_from(exc: requests.HTTPError, jql: str) -> JiraJqlError:
     """Preserve JIRA's `errorMessages` list verbatim for caller introspection."""
     messages: list[str] = []
-    with contextlib.suppress(ValueError, AttributeError):
-        messages = list(exc.response.json().get("errorMessages") or [])
+    # AttributeError stays in the suppress tuple even with the None narrowed away: a 400
+    # body that decodes to a JSON *array* reaches `.get` on a list.
+    if exc.response is not None:
+        with contextlib.suppress(ValueError, AttributeError):
+            messages = list(exc.response.json().get("errorMessages") or [])
     return JiraJqlError(f"JIRA rejected JQL: {jql!r}; messages={messages}", error_messages=messages)
 
 
@@ -166,7 +179,7 @@ class JiraClient:
 
     # ----- single-issue fetches -----------------------------------------------
 
-    def get_issue(self, key: str) -> dict:
+    def get_issue(self, key: str) -> dict[str, Any]:
         """Resilient single-issue fetch — the default safe path.
 
         Routes through `get_issue_resilient`'s three-tier fallback (full → hub
@@ -187,7 +200,7 @@ class JiraClient:
         fields: str = "*all",
         timeout: int | None = None,
         max_attempts: int | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Raw `GET /issue/{key}` with no fallback. Escape hatch for callers
         that need direct control — fast-fail probes (autoheal), changelog-only
         fetches with a tight budget, etc. Most callers should use `get_issue`
@@ -196,7 +209,7 @@ class JiraClient:
         Defaults to the full payload (`fields=*all` + changelog).
         """
         url = f"{self.base_url}/rest/api/2/issue/{key}"
-        return request_with_retry(
+        issue: dict[str, Any] = request_with_retry(
             self.session,
             "GET",
             url,
@@ -204,11 +217,12 @@ class JiraClient:
             timeout=timeout or self.timeout,
             max_attempts=max_attempts or self.max_attempts,
         ).json()
+        return issue
 
-    def get_issue_minimal(self, key: str, *, fields: str = _MINIMAL_FIELDS) -> dict:
+    def get_issue_minimal(self, key: str, *, fields: str = _MINIMAL_FIELDS) -> dict[str, Any]:
         """Fallback fetch with a small field set + short timeout. No changelog."""
         url = f"{self.base_url}/rest/api/2/issue/{key}"
-        return request_with_retry(
+        issue: dict[str, Any] = request_with_retry(
             self.session,
             "GET",
             url,
@@ -216,8 +230,9 @@ class JiraClient:
             timeout=60,
             max_attempts=3,
         ).json()
+        return issue
 
-    def get_issuelinks(self, key: str, *, timeout: int = 600) -> list[dict]:
+    def get_issuelinks(self, key: str, *, timeout: int = 600) -> list[dict[str, Any]]:
         """Fetch ONLY the `issuelinks` field. Long default timeout — hub issues with
         thousands of links can take minutes to serialize."""
         url = f"{self.base_url}/rest/api/2/issue/{key}"
@@ -231,7 +246,7 @@ class JiraClient:
         ).json()
         return (data.get("fields") or {}).get("issuelinks") or []
 
-    def get_changelog(self, key: str, *, page_size: int = 100) -> list[dict]:
+    def get_changelog(self, key: str, *, page_size: int = 100) -> list[dict[str, Any]]:
         """Full changelog as a flat history-entry list.
 
         Prefers the paginated `/issue/{key}/changelog` sub-resource (small per-page
@@ -271,9 +286,9 @@ class JiraClient:
             raise
         return True
 
-    def _changelog_paged(self, key: str, page_size: int) -> list[dict]:
+    def _changelog_paged(self, key: str, page_size: int) -> list[dict[str, Any]]:
         url = f"{self.base_url}/rest/api/2/issue/{key}/changelog"
-        histories: list[dict] = []
+        histories: list[dict[str, Any]] = []
         start_at = 0
         while True:
             data = request_with_retry(
@@ -292,7 +307,7 @@ class JiraClient:
                 break
         return histories
 
-    def _changelog_expand(self, key: str) -> list[dict]:
+    def _changelog_expand(self, key: str) -> list[dict[str, Any]]:
         """JIRA Server changelog: the issue resource with `expand=changelog`. Returns
         the full history in one response (`changelog.histories`)."""
         data = request_with_retry(
@@ -303,9 +318,10 @@ class JiraClient:
             timeout=self.timeout,
             max_attempts=self.max_attempts,
         ).json()
-        return data.get("changelog", {}).get("histories", [])
+        histories: list[dict[str, Any]] = data.get("changelog", {}).get("histories", [])
+        return histories
 
-    def get_worklogs(self, key: str, *, page_size: int = 100) -> list[dict]:
+    def get_worklogs(self, key: str, *, page_size: int = 100) -> list[dict[str, Any]]:
         """Full worklog list via paginated `/rest/api/2/issue/{key}/worklog`.
 
         JIRA search responses include at most 20 worklogs inline. This method
@@ -313,7 +329,7 @@ class JiraClient:
         truncated (`fields.worklog.total > len(fields.worklog.worklogs)`).
         """
         url = f"{self.base_url}/rest/api/2/issue/{key}/worklog"
-        worklogs: list[dict] = []
+        worklogs: list[dict[str, Any]] = []
         start_at = 0
         while True:
             data = request_with_retry(
@@ -332,7 +348,7 @@ class JiraClient:
                 break
         return worklogs
 
-    def get_comments(self, key: str, *, page_size: int = 50) -> list[dict]:
+    def get_comments(self, key: str, *, page_size: int = 50) -> list[dict[str, Any]]:
         """Full comment list via paginated `/rest/api/2/issue/{key}/comment`.
 
         JIRA search responses cap inline comments (the exact limit is
@@ -341,7 +357,7 @@ class JiraClient:
         `fields.comment.total > len(fields.comment.comments)`.
         """
         url = f"{self.base_url}/rest/api/2/issue/{key}/comment"
-        comments: list[dict] = []
+        comments: list[dict[str, Any]] = []
         start_at = 0
         while True:
             data = request_with_retry(
@@ -360,7 +376,7 @@ class JiraClient:
                 break
         return comments
 
-    def get_remote_links(self, key: str) -> list[dict]:
+    def get_remote_links(self, key: str) -> list[dict[str, Any]]:
         """All remote links for an issue via `/rest/api/2/issue/{key}/remotelink`.
 
         Remote links (Confluence pages, GitHub PRs, external URLs) are not
@@ -378,7 +394,7 @@ class JiraClient:
             raise JiraParseError(f"remotelink for {key!r} returned a non-list body: {data!r}")
         return []
 
-    def get_watchers(self, key: str) -> list[dict]:
+    def get_watchers(self, key: str) -> list[dict[str, Any]]:
         """Watcher identity list via `/rest/api/2/issue/{key}/watchers`.
 
         Returns the `watchers` array (full user objects: `name`, `key`,
@@ -398,7 +414,7 @@ class JiraClient:
             raise
         return data.get("watchers") or []
 
-    def get_voters(self, key: str) -> list[dict]:
+    def get_voters(self, key: str) -> list[dict[str, Any]]:
         """Voter identity list via `/rest/api/2/issue/{key}/votes`.
 
         Returns the `voters` array (user objects). As with watchers, the vote
@@ -422,7 +438,7 @@ class JiraClient:
         key: str | None = None,
         account_id: str | None = None,
         expand: str | None = "groups,applicationRoles",
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Single user via `/rest/api/2/user`, resolved by the right param for the deployment.
 
         JIRA **Server** identifies users by `username=` or `key=` (the opaque
@@ -450,9 +466,10 @@ class JiraClient:
             raise ValueError("get_user requires exactly one of username, key, or account_id")
         url = f"{self.base_url}/rest/api/2/user"
         try:
-            return request_with_retry(
+            user: dict[str, Any] = request_with_retry(
                 self.session, "GET", url, params=params, timeout=30, max_attempts=3
             ).json()
+            return user
         except requests.exceptions.HTTPError as exc:
             if _is_http_404(exc):
                 return {}
@@ -543,7 +560,7 @@ class JiraClient:
         total failure with non-4xx errors raises `JiraFetchError` with the
         underlying exception chain.
         """
-        fast_fail = {"timeout": 60, "max_attempts": 2}
+        fast_fail: _FastFail = {"timeout": 60, "max_attempts": 2}
         try:
             issue = self.get_issue_raw(key, expand="names,schema", **fast_fail)
             return ResilientFetchResult(issue, "full")
@@ -584,16 +601,17 @@ class JiraClient:
 
     # ----- field catalog ------------------------------------------------------
 
-    def list_fields(self) -> list[dict]:
+    def list_fields(self) -> list[dict[str, Any]]:
         """`GET /rest/api/2/field`. Raises `requests.RequestException` on a failed request,
         or `JiraParseError` if a 200 body is not JSON (SSO/proxy HTML)."""
         url = f"{self.base_url}/rest/api/2/field"
         resp = self.session.get(url, timeout=30)
         resp.raise_for_status()
         try:
-            return resp.json()
+            fields: list[dict[str, Any]] = resp.json()
         except ValueError as exc:
             raise JiraParseError(f"list_fields: 200 but non-JSON body from {url}") from exc
+        return fields
 
     # ----- listings -----------------------------------------------------------
 
@@ -849,7 +867,9 @@ class JiraClient:
                 f"next-minute probe row has unparseable `updated`={updated!r}"
             ) from exc
 
-    def _search_one_page(self, jql: str, page_size: int, *, start_at: int = 0) -> tuple[dict, Tier]:
+    def _search_one_page(
+        self, jql: str, page_size: int, *, start_at: int = 0
+    ) -> tuple[dict[str, Any], Tier]:
         """Three-tier `/search` request mirroring `get_issue_resilient`'s shape.
 
         Tier 1 (full):    `fields=["*all"]` + `expand=changelog,names,schema`.
@@ -881,7 +901,7 @@ class JiraClient:
           - `JiraFetchError` only if all three tiers fail with non-400 errors.
         """
         url = f"{self.base_url}/rest/api/2/search"
-        fast_fail = {"timeout": 60, "max_attempts": 2}
+        fast_fail: _FastFail = {"timeout": 60, "max_attempts": 2}
         base = {"jql": jql, "startAt": start_at, "maxResults": page_size}
         try:
             body = base | {"fields": ["*all"], "expand": ["changelog", "names", "schema"]}

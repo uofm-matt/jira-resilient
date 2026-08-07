@@ -109,6 +109,13 @@ Three failure modes, two of which look like success:
   editing, so a failure after a successful upload no longer strands the release permanently.
 - The publish trigger is `v[0-9]*`. Non-release tags such as `v1-locked-…` matched `v*` and would
   have started a publish run.
+- **The shipped type annotations are now verified.** The package has advertised `py.typed` and the
+  `Typing :: Typed` classifier since 0.1.x, which tells every downstream type checker to trust these
+  annotations, and nothing checked them — `mypy --strict` reported 36 errors. Public signatures that
+  said `dict` now say `dict[str, Any]`, so consumers get the real shape instead of `Any`. `mypy` runs
+  in CI and reports clean, as do `ty` and `basedpyright` independently. No runtime behavior changed
+  and no suppression was added; the repo still contains zero `type: ignore`, `noqa`, or
+  `pragma: no cover`.
 
 ## [0.5.0] — 2026-06-20
 

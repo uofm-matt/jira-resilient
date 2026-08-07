@@ -22,6 +22,7 @@ import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from http.cookiejar import DefaultCookiePolicy
+from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -39,7 +40,7 @@ class _TLSAdapter(HTTPAdapter):
     otherwise urllib3 raises `ValueError: Cannot set verify_mode to CERT_NONE when
     check_hostname is enabled` against our context."""
 
-    def __init__(self, *args, verify: str | bool = True, **kwargs):
+    def __init__(self, *args: Any, verify: str | bool = True, **kwargs: Any):
         self._verify = verify
         super().__init__(*args, **kwargs)
 
@@ -51,11 +52,11 @@ class _TLSAdapter(HTTPAdapter):
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    def init_poolmanager(self, *args, **kwargs):
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
         kwargs["ssl_context"] = self._ssl_context()
         super().init_poolmanager(*args, **kwargs)
 
-    def proxy_manager_for(self, *args, **kwargs):
+    def proxy_manager_for(self, *args: Any, **kwargs: Any) -> Any:
         kwargs["ssl_context"] = self._ssl_context()
         return super().proxy_manager_for(*args, **kwargs)
 
@@ -137,8 +138,8 @@ def request_with_retry(
     method: str,
     url: str,
     *,
-    json: dict | None = None,
-    params: dict | None = None,
+    json: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
     timeout: int = 120,
     max_attempts: int = 5,
 ) -> requests.Response:
