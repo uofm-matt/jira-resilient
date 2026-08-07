@@ -19,8 +19,14 @@ class TestBuildJql:
         assert out.endswith(" ORDER BY updated ASC")
 
     def test_with_extra_filter(self):
+        # Parenthesized: `AND a OR b` would otherwise parse as `(project AND a) OR b`,
+        # matching rows in every project. See build_full_scan_jql's docstring.
         out = build_jql("PROJ", extra_filter='status = "Done"')
-        assert 'AND status = "Done"' in out
+        assert 'AND (status = "Done")' in out
+
+    def test_extra_filter_is_parenthesized(self):
+        out = build_jql("PROJ", extra_filter='status = "Done" OR labels = x')
+        assert 'AND (status = "Done" OR labels = x)' in out
 
     def test_rejects_invalid_project_key(self):
         for bad in ("proj", "PROJ-1", "x", "ABC DEF", ""):

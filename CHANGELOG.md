@@ -2,6 +2,121 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] — 2026-08-06
+
+A data-integrity release. **If you have ever passed `extra_filter` containing a top-level `OR`,
+read "Who is affected" below — some extracts need re-running.**
+
+### Fixed
+
+- **`extra_filter` no longer escapes the project scope.** The filter was appended unparenthesized,
+  and JQL binds `AND` tighter than `OR`, so `project = "P" AND status = x OR labels = y` parsed as
+  `(project = "P" AND status = x) OR (labels = y)` — every row matching the right-hand branch
+  qualified **regardless of project**. A project-scoped extract silently received rows from every
+  other project. The filter is now parenthesized at every construction site.
+
+- **Full scans no longer hang on such a filter.** The same mis-parse unbound the `id > N` cursor
+  clause. Out-of-project rows with low ids sorted first under `ORDER BY id ASC`, filled every page,
+  and re-pinned the cursor to the same value, so the scan issued requests forever without advancing.
+  Measured on a synthetic universe: 26 `/search` calls, cursor stuck at `id > 2`.
+
+- **`search_seek`'s full-scan path now validates its arguments.** It hand-built its JQL instead of
+  using the `jql.py` builders, so it applied neither the project-key check nor the `extra_filter`
+  guard — `search_seek('x" OR project = "OTHER')` was accepted and emitted a query matching two
+  projects. The delta path always validated. Both now share one builder (`build_full_scan_jql`).
+
+### Who is affected
+
+Three call paths, all fixed. You are affected if you passed an `extra_filter` containing a
+top-level `OR` (one not already wrapped in parentheses) to any of:
+
+| path | symptom |
+|---|---|
+| `search_seek(...)` full scan (`after_ts=None`) | out-of-project rows, then a scan that never ends |
+| `search_seek(..., after_ts=...)` **after a Lucene reindex** | same — the reindex recovery scan reused the unvalidated builder |
+| `build_jql(...)` → `search_paged` / `list_keys` | out-of-project rows, **terminates normally with no error** |
+
+The delta drain itself was correct; the delta path became affected only once a reindex was detected.
+The `build_jql` path is the quiet one — it returns wrong data without hanging, and it has behaved this
+way since 0.1.x.
+
+Three failure modes, two of which look like success:
+
+- **Contaminated** — foreign rows landed in your extract. Detect with `SELECT DISTINCT` on the
+  project key or issue-key prefix in your target table.
+- **Truncated** — the scan was killed after hanging, so the extract is a prefix, and any persisted
+  cursor is the loop's fixed point: every later run re-reads the same page and appends nothing.
+  Detect with a delta job whose new-row count has been flat since an `OR` filter was introduced.
+- **Wedged** — the job never finished and never alarmed. It kept issuing HTTP requests, so it looks
+  alive to any process- or network-level liveness check. Detect by runtime, not by status.
+
+### Changed
+
+- **`build_jql` output changed** (public API). `extra_filter` is now wrapped:
+  `... AND (status = "Done") ...` rather than `... AND status = "Done" ...`. For a filter with no
+  top-level `OR` this selects exactly the same rows; for one with a top-level `OR` it selects
+  **fewer** rows — the ones that were never in scope. Code asserting on the exact string will need
+  updating.
+- **Invalid project keys and unsafe filters now raise `JiraQueryValidationError`** instead of bare
+  `ValueError`. It subclasses **both** `ValueError` and `JiraResilientError`, so existing
+  `except ValueError` handlers keep working and `except JiraResilientError` now catches it too. This
+  matters because full-scan validation is new: a bad filter previously reached the server and came
+  back as `JiraJqlError` (a `JiraResilientError`), so without the second base, callers guarding the
+  family would have seen a new escape.
+- **The `extra_filter` guard is less trigger-happy on ordinary data.** Its DDL-keyword check now
+  ignores quoted string literals, so `status = "Update Required"` and `component = "Union Pay"` are
+  accepted. Unquoted values containing a whole-word keyword (`labels = delete-me`) are still
+  rejected — quote them. The comment/`--` check deliberately still runs against the raw string.
+- The exception-hierarchy docstring no longer claims every escaping exception inherits from
+  `JiraResilientError`; the thin endpoint wrappers let `requests.RequestException` through, as the
+  README already documented.
+
+### Added
+
+- `jira_resilient.jql.build_full_scan_jql` — the full-scan cursor primitive. Module-level but
+  deliberately **not** exported in `__all__`, matching the two delta builders: each emits one page of
+  a scan and looks like a complete query when called alone.
+- `tests/jql_model.py` — a precedence-correct JQL evaluator derived from JIRA's grammar rather than
+  from this library, plus `tests/test_search_scope.py`, which asserts two properties across all four
+  query paths: a scan never returns a row outside the requested project, and an `extra_filter` can
+  only narrow a result set. A string assertion cannot catch an operator-precedence defect, which is
+  why `test_extra_filter_is_parenthesized` passed throughout the life of this bug.
+
+### Packaging
+
+- `.python-version` and the local planning doc are gitignored, and the sdist now uses an explicit
+  allowlist. Hatchling excludes gitignored files but **not** untracked ones, so both would otherwise
+  have shipped to PyPI in the next release. CI re-checks the sdist contents so a later config edit
+  cannot silently re-open the leak.
+- Python 3.14 is now tested and declared. `requires-python` already permitted it.
+
+### Gate (no runtime effect)
+
+- **A dropped loop-exit condition now fails the suite instead of hanging it.** `client.py` pages
+  with `while True`, and mutating the `not page` half of the termination guard made the suite run
+  until killed rather than report a failure. `pytest-timeout` with a 15s per-test bound converts
+  that into a normal failure; `required_plugins` makes the plugin's absence a clear error rather
+  than an internal one.
+- **All four copies of the paging loop now have an oracle.** Only `get_worklogs` had one, so
+  mutating the same guard in `get_changelog`, `get_comments`, or `list_keys` left the suite green.
+  Verified: each of the four mutants is now caught.
+- **The release path is no longer weaker than `main`.** A tag push matches no branch filter, so
+  `publish.yml` alone gated releases — pytest and `ruff check` on 3.12, nothing else. It now calls
+  `test.yml`, which adds 3.13/3.14, the format check, coverage floors, a lowest-direct dependency
+  floor job, `twine check`, and a wheel/sdist install smoke test run without the source tree on
+  `sys.path`. The artifact that is inspected is the artifact that ships.
+- Publishing is now re-runnable: `skip-existing` on the upload, and release creation falls back to
+  editing, so a failure after a successful upload no longer strands the release permanently.
+- The publish trigger is `v[0-9]*`. Non-release tags such as `v1-locked-…` matched `v*` and would
+  have started a publish run.
+- **The shipped type annotations are now verified.** The package has advertised `py.typed` and the
+  `Typing :: Typed` classifier since 0.1.x, which tells every downstream type checker to trust these
+  annotations, and nothing checked them — `mypy --strict` reported 36 errors. Public signatures that
+  said `dict` now say `dict[str, Any]`, so consumers get the real shape instead of `Any`. `mypy` runs
+  in CI and reports clean, as do `ty` and `basedpyright` independently. No runtime behavior changed
+  and no suppression was added; the repo still contains zero `type: ignore`, `noqa`, or
+  `pragma: no cover`.
+
 ## [0.5.0] — 2026-06-20
 
 A correctness + hardening release. **Breaking:** the unsound `build_seek_jql` is removed and

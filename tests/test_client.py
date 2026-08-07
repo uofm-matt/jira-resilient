@@ -756,7 +756,7 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
     import re
 
     seen_jql: list[str] = []
-    universe = [{"key": f"P-{i}", "id": str(i), "fields": {}} for i in range(1, 6)]
+    universe = [{"key": f"PX-{i}", "id": str(i), "fields": {}} for i in range(1, 6)]
 
     def cb(request):
         jql = json.loads(request.body)["jql"]
@@ -772,9 +772,9 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
         callback=cb,
         content_type="application/json",
     )
-    pages = list(client.search_seek("P"))
+    pages = list(client.search_seek("PX"))
     keys = [i["key"] for p in pages for i in p.issues]
-    assert keys == ["P-1", "P-2", "P-3", "P-4", "P-5"]
+    assert keys == ["PX-1", "PX-2", "PX-3", "PX-4", "PX-5"]
     assert all("ORDER BY id ASC" in j for j in seen_jql)
     assert all("updated" not in j for j in seen_jql)
 
@@ -1044,22 +1044,40 @@ def test_get_issue_resilient_fast_fails_on_403_as_auth_error(client, base_url):
     assert len(responses.calls) == 1
 
 
+# The same startAt/total paging loop is written out four times. Its termination condition
+# `if not page or (total is not None and start_at >= total)` carries two independent
+# guarantees, and until this test only `get_worklogs` had an oracle for either — mutating the
+# `not page` half at the other three sites left the suite fully green.
+_PAGINATED = [
+    ("changelog", responses.GET, "/issue/XX-1/changelog", "values", lambda c: c.get_changelog),
+    ("worklogs", responses.GET, "/issue/XX-1/worklog", "worklogs", lambda c: c.get_worklogs),
+    ("comments", responses.GET, "/issue/XX-1/comment", "comments", lambda c: c.get_comments),
+    ("keys", responses.POST, "/search", "issues", lambda c: c.list_keys),
+]
+
+
 @responses.activate
-def test_get_worklogs_keeps_paging_when_total_absent(client, base_url):
-    # JIRA variants that omit `total`: a FULL first page must not stop the loop (the old
-    # `data.get("total", 0)` read absent total as 0 → silent one-page truncation).
-    responses.add(
-        responses.GET,
-        f"{base_url}/rest/api/2/issue/XX-1/worklog",
-        json={"worklogs": [{"id": "1"}, {"id": "2"}]},  # full page, no total
-    )
-    responses.add(
-        responses.GET,
-        f"{base_url}/rest/api/2/issue/XX-1/worklog",
-        json={"worklogs": [{"id": "3"}]},  # more, no total
-    )
-    responses.add(responses.GET, f"{base_url}/rest/api/2/issue/XX-1/worklog", json={"worklogs": []})
-    assert client.get_worklogs("XX-1", page_size=2) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+@pytest.mark.parametrize(("label", "method", "path", "key", "getter"), _PAGINATED)
+def test_paging_keeps_going_when_total_absent(client, base_url, label, method, path, key, getter):
+    """JIRA variants omit `total`; absent must mean "keep paging", not "stop".
+
+    The old `data.get("total", 0)` read an absent total as 0, so `start_at >= total` was true
+    immediately and every one of these methods silently returned just its first page.
+    """
+    items = [{"id": "1", "key": "XX-1"}, {"id": "2", "key": "XX-2"}, {"id": "3", "key": "XX-3"}]
+    for page in (items[:2], items[2:], []):
+        responses.add(method, f"{base_url}/rest/api/2{path}", json={key: page})
+    assert len(getter(client)("XX-1" if label != "keys" else "project = XX")) == 3
+
+
+@responses.activate
+@pytest.mark.parametrize(("label", "method", "path", "key", "getter"), _PAGINATED)
+def test_paging_terminates_on_an_empty_page(client, base_url, label, method, path, key, getter):
+    """The `not page` half of the guard is the only thing ending the loop when `total` is
+    absent. Drop it and these methods request the same empty page forever — a hang, not a
+    wrong answer, which is why the suite must bound per-test runtime (see pyproject timeout)."""
+    responses.add(method, f"{base_url}/rest/api/2{path}", json={key: []})
+    assert getter(client)("XX-1" if label != "keys" else "project = XX") == []
 
 
 # ----- WP-4: error taxonomy & contract fidelity ---------------------------
