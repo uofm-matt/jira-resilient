@@ -6,6 +6,7 @@ import json
 import operator
 import re
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 import responses
@@ -1078,6 +1079,29 @@ def test_paging_terminates_on_an_empty_page(client, base_url, label, method, pat
     wrong answer, which is why the suite must bound per-test runtime (see pyproject timeout)."""
     responses.add(method, f"{base_url}/rest/api/2{path}", json={key: []})
     assert getter(client)("XX-1" if label != "keys" else "project = XX") == []
+
+
+@responses.activate
+@pytest.mark.parametrize(("label", "method", "path", "key", "getter"), _PAGINATED)
+def test_paging_advances_start_at_by_page_length(
+    client, base_url, label, method, path, key, getter
+):
+    """`startAt` advances by the rows actually returned, never by the page size asked for.
+
+    JIRA is free to answer `maxResults=N` with fewer than N rows; advancing by N would
+    skip every row in the gap. Now that one loop serves all four endpoints, this is the
+    only oracle standing between that mutation and a silent data hole everywhere.
+    """
+    for page in ([{"id": "1", "key": "XX-1"}], [{"id": "2", "key": "XX-2"}], []):
+        responses.add(method, f"{base_url}/rest/api/2{path}", json={key: page})
+    getter(client)("XX-1" if label != "keys" else "project = XX")
+    sent = [
+        json.loads(c.request.body)["startAt"]
+        if method == responses.POST
+        else int(parse_qs(urlparse(c.request.url).query)["startAt"][0])
+        for c in responses.calls
+    ]
+    assert sent == [0, 1, 2]
 
 
 # ----- WP-4: error taxonomy & contract fidelity ---------------------------

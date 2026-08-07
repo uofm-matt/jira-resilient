@@ -262,7 +262,16 @@ class JiraClient:
         """
         if self._changelog_paginated:
             try:
-                return self._changelog_paged(key, page_size)
+                return list(
+                    self._paginate(
+                        "GET",
+                        f"{self.base_url}/rest/api/2/issue/{key}/changelog",
+                        "values",
+                        page_size=page_size,
+                        timeout=60,
+                        max_attempts=3,
+                    )
+                )
             except requests.exceptions.HTTPError as exc:
                 if exc.response is None or exc.response.status_code != 404:
                     raise
@@ -286,26 +295,55 @@ class JiraClient:
             raise
         return True
 
-    def _changelog_paged(self, key: str, page_size: int) -> list[dict[str, Any]]:
-        url = f"{self.base_url}/rest/api/2/issue/{key}/changelog"
-        histories: list[dict[str, Any]] = []
+    def _paginate(
+        self,
+        method: str,
+        url: str,
+        envelope_key: str,
+        *,
+        page_size: int,
+        timeout: int,
+        max_attempts: int,
+        body: dict[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """The `startAt`/`total` offset loop every JIRA collection sub-resource shares.
+
+        `envelope_key` names the array in the response envelope (`values` / `worklogs` /
+        `comments` / `issues`). `body` set routes the paging keys into a JSON body
+        (`POST /search`); unset puts them in the query string — JIRA has no
+        GET-with-body, so the transport follows from the method.
+
+        A generator, so a caller's per-item work (list_keys' `i["key"]`) raises on the
+        page that carries the bad row instead of after the whole scan. Every caller must
+        therefore MATERIALIZE it before returning: `get_changelog` calls this inside a
+        `try` that maps a 404 onto a one-way route flip, and returning the bare generator
+        would let that 404 escape the handler on first iteration instead.
+
+        The exit condition carries two independent guarantees. An ABSENT `total` means
+        "keep paging" — JIRA variants omit it, and reading absent as 0 silently truncates
+        every caller to one page. An empty page ends the scan, and is the ONLY exit when
+        `total` is absent. `start_at` advances by the page's real length, never by
+        `page_size`: a server free to return fewer rows than asked would otherwise leave
+        a hole at every short page.
+        """
         start_at = 0
         while True:
+            paging = {"startAt": start_at, "maxResults": page_size}
             data = request_with_retry(
                 self.session,
-                "GET",
+                method,
                 url,
-                params={"startAt": start_at, "maxResults": page_size},
-                timeout=60,
-                max_attempts=3,
+                params=paging if body is None else None,
+                json=None if body is None else body | paging,
+                timeout=timeout,
+                max_attempts=max_attempts,
             ).json()
-            page = data.get("values") or []
-            histories.extend(page)
+            page = data.get(envelope_key) or []
+            yield from page
             start_at += len(page)
             total = data.get("total")
             if not page or (total is not None and start_at >= total):
-                break
-        return histories
+                return
 
     def _changelog_expand(self, key: str) -> list[dict[str, Any]]:
         """JIRA Server changelog: the issue resource with `expand=changelog`. Returns
@@ -328,25 +366,16 @@ class JiraClient:
         fetches the complete history for issues where the inline response was
         truncated (`fields.worklog.total > len(fields.worklog.worklogs)`).
         """
-        url = f"{self.base_url}/rest/api/2/issue/{key}/worklog"
-        worklogs: list[dict[str, Any]] = []
-        start_at = 0
-        while True:
-            data = request_with_retry(
-                self.session,
+        return list(
+            self._paginate(
                 "GET",
-                url,
-                params={"startAt": start_at, "maxResults": page_size},
+                f"{self.base_url}/rest/api/2/issue/{key}/worklog",
+                "worklogs",
+                page_size=page_size,
                 timeout=60,
                 max_attempts=3,
-            ).json()
-            page = data.get("worklogs") or []
-            worklogs.extend(page)
-            start_at += len(page)
-            total = data.get("total")
-            if not page or (total is not None and start_at >= total):
-                break
-        return worklogs
+            )
+        )
 
     def get_comments(self, key: str, *, page_size: int = 50) -> list[dict[str, Any]]:
         """Full comment list via paginated `/rest/api/2/issue/{key}/comment`.
@@ -356,25 +385,16 @@ class JiraClient:
         to 10 on older JIRA Server versions). Use when
         `fields.comment.total > len(fields.comment.comments)`.
         """
-        url = f"{self.base_url}/rest/api/2/issue/{key}/comment"
-        comments: list[dict[str, Any]] = []
-        start_at = 0
-        while True:
-            data = request_with_retry(
-                self.session,
+        return list(
+            self._paginate(
                 "GET",
-                url,
-                params={"startAt": start_at, "maxResults": page_size},
+                f"{self.base_url}/rest/api/2/issue/{key}/comment",
+                "comments",
+                page_size=page_size,
                 timeout=60,
                 max_attempts=3,
-            ).json()
-            page = data.get("comments") or []
-            comments.extend(page)
-            start_at += len(page)
-            total = data.get("total")
-            if not page or (total is not None and start_at >= total):
-                break
-        return comments
+            )
+        )
 
     def get_remote_links(self, key: str) -> list[dict[str, Any]]:
         """All remote links for an issue via `/rest/api/2/issue/{key}/remotelink`.
@@ -630,31 +650,18 @@ class JiraClient:
 
     def list_keys(self, jql: str) -> list[str]:
         """All matching keys via `fields=key`. Tiny payload, never times out."""
-        url = f"{self.base_url}/rest/api/2/search"
-        keys: list[str] = []
-        start_at = 0
-        while True:
-            body = {
-                "jql": jql,
-                "startAt": start_at,
-                "maxResults": _LIST_KEYS_PAGE_SIZE,
-                "fields": ["key"],
-            }
-            data = request_with_retry(
-                self.session,
+        return [
+            i["key"]
+            for i in self._paginate(
                 "POST",
-                url,
-                json=body,
+                f"{self.base_url}/rest/api/2/search",
+                "issues",
+                page_size=_LIST_KEYS_PAGE_SIZE,
                 timeout=self.timeout,
                 max_attempts=self.max_attempts,
-            ).json()
-            page = [i["key"] for i in data.get("issues", [])]
-            keys.extend(page)
-            start_at += len(page)
-            total = data.get("total")
-            if not page or (total is not None and start_at >= total):
-                break
-        return keys
+                body={"jql": jql, "fields": ["key"]},
+            )
+        ]
 
     # ----- pagination ---------------------------------------------------------
 
