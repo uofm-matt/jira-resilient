@@ -1168,3 +1168,25 @@ def test_jira_jql_error_is_exported():
     import jira_resilient
 
     assert jira_resilient.JiraJqlError is not None and "JiraJqlError" in jira_resilient.__all__
+
+
+@responses.activate
+def test_search_paged_advances_start_at_by_page_length(client, base_url):
+    """`search_paged` keeps its own copy of the paging loop — it needs the three-tier fetch
+    and yields envelopes, so it cannot use `_paginate` — and that copy was unpinned.
+
+    JIRA may answer `maxResults=N` with fewer than N rows; advancing by N skips the gap.
+    The `_paginate` version of this test covers four callers and not this one.
+    """
+    pages = [
+        {"issues": [{"id": "1", "key": "XX-1"}], "names": {}, "schema": {}, "total": 2},
+        {"issues": [{"id": "2", "key": "XX-2"}], "names": {}, "schema": {}, "total": 2},
+    ]
+    for p in pages:
+        responses.add(responses.POST, f"{base_url}/rest/api/2/search", json=p)
+    got = [
+        i["key"] for page in client.search_paged("project = XX", page_size=2) for i in page.issues
+    ]
+    sent = [json.loads(c.request.body)["startAt"] for c in responses.calls]
+    assert got == ["XX-1", "XX-2"], f"short page skipped rows: {got}"
+    assert sent == [0, 1], f"startAt advanced by page_size, not row count: {sent}"

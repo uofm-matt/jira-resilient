@@ -71,6 +71,23 @@ def _is_client_error(exc: BaseException) -> bool:
     )
 
 
+def _json_dict(resp: requests.Response, what: str) -> dict[str, Any]:
+    """A 2xx body that must be a JSON OBJECT, or `JiraParseError`.
+
+    An SSO/proxy page, or an error envelope, decodes to a string, a list or null, and `.get`
+    on any of those raises `AttributeError` — which is neither a `JiraResilientError` nor a
+    `requests.RequestException`, so it escapes both boundaries the README tells callers to
+    catch. Every path that decodes a body and then reads a key out of it goes through here.
+    """
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise JiraParseError(f"{what}: 200 but a non-JSON body from {resp.url}") from exc
+    if not isinstance(body, dict):
+        raise JiraParseError(f"{what}: 200 but a non-object body from {resp.url}: {body!r}")
+    return body
+
+
 def _jql_error_from(exc: requests.HTTPError, jql: str) -> JiraJqlError:
     """Preserve JIRA's `errorMessages` list verbatim for caller introspection."""
     messages: list[str] = []
@@ -140,7 +157,9 @@ class JiraClient:
         return False. Logs the displayName on success.
         """
         try:
-            resp = self.session.get(f"{self.base_url}/rest/api/2/myself", timeout=30)
+            resp = self.session.get(
+                f"{self.base_url}/rest/api/2/myself", timeout=30, allow_redirects=False
+            )
         except requests.RequestException as exc:
             logger.error("Auth check error: %s", exc)
             return False
@@ -150,6 +169,10 @@ class JiraClient:
             except ValueError:
                 # A 200 with a non-JSON body is an SSO/proxy login page, not an authed myself.
                 logger.error("Auth check: HTTP 200 but a non-JSON body (SSO/proxy login page?)")
+                return False
+            except AttributeError:
+                # A 200 that decodes to a JSON list or string is an error envelope, not a user.
+                logger.error("Auth check: HTTP 200 but the body is not a JSON object")
                 return False
             logger.info("Auth OK: %s", name)
             return True
@@ -175,11 +198,24 @@ class JiraClient:
         """
         if self._server_tz is None:
             try:
-                resp = self.session.get(f"{self.base_url}/rest/api/2/serverInfo", timeout=30)
+                resp = self.session.get(
+                    f"{self.base_url}/rest/api/2/serverInfo", timeout=30, allow_redirects=False
+                )
+                if 300 <= resp.status_code < 400:
+                    # Not followed, and not adopted: a proxy/SSO redirect's serverTime is the
+                    # LOGIN host's offset, and this value is rendered into every delta JQL
+                    # literal — taking it would shift the minute window the scan drains.
+                    raise ValueError(f"{resp.status_code} redirect on serverInfo (proxy/SSO?)")
                 resp.raise_for_status()
                 server_time = resp.json().get("serverTime")
                 self._server_tz = datetime.fromisoformat(server_time).tzinfo
-            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            except (
+                requests.RequestException,
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+            ) as exc:
                 logger.warning("server_tz probe failed (%s) — falling back to UTC", exc)
             # UTC if the probe failed, or if serverTime parsed but was naive.
             if self._server_tz is None:
@@ -245,14 +281,15 @@ class JiraClient:
         """Fetch ONLY the `issuelinks` field. Long default timeout — hub issues with
         thousands of links can take minutes to serialize."""
         url = f"{self.base_url}/rest/api/2/issue/{key}"
-        data = request_with_retry(
+        resp = request_with_retry(
             self.session,
             "GET",
             url,
             params={"fields": "issuelinks"},
             timeout=timeout,
             max_attempts=2,
-        ).json()
+        )
+        data = _json_dict(resp, f"get_issuelinks({key!r})")
         return (data.get("fields") or {}).get("issuelinks") or []
 
     def get_changelog(self, key: str, *, page_size: int = 100) -> list[dict[str, Any]]:
@@ -338,7 +375,7 @@ class JiraClient:
         start_at = 0
         while True:
             paging = {"startAt": start_at, "maxResults": page_size}
-            data = request_with_retry(
+            resp = request_with_retry(
                 self.session,
                 method,
                 url,
@@ -346,7 +383,8 @@ class JiraClient:
                 json=None if body is None else body | paging,
                 timeout=timeout,
                 max_attempts=max_attempts,
-            ).json()
+            )
+            data = _json_dict(resp, f"{url} page")
             page = data.get(envelope_key) or []
             yield from page
             start_at += len(page)
@@ -357,14 +395,15 @@ class JiraClient:
     def _changelog_expand(self, key: str) -> list[dict[str, Any]]:
         """JIRA Server changelog: the issue resource with `expand=changelog`. Returns
         the full history in one response (`changelog.histories`)."""
-        data = request_with_retry(
+        resp = request_with_retry(
             self.session,
             "GET",
             f"{self.base_url}/rest/api/2/issue/{key}",
             params={"expand": "changelog", "fields": "summary"},
             timeout=self.timeout,
             max_attempts=self.max_attempts,
-        ).json()
+        )
+        data = _json_dict(resp, f"get_changelog({key!r}) expand route")
         histories: list[dict[str, Any]] = data.get("changelog", {}).get("histories", [])
         return histories
 
@@ -942,7 +981,8 @@ class JiraClient:
         base = {"jql": jql, "startAt": start_at, "maxResults": page_size}
         try:
             body = base | {"fields": ["*all"], "expand": ["changelog", "names", "schema"]}
-            data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
+            resp = request_with_retry(self.session, "POST", url, json=body, **fast_fail)
+            data = _json_dict(resp, "/search page")
             return data, "full"
         except requests.RequestException as exc_full:
             # 400 means JIRA rejected the JQL itself; hub/minimal use the same
@@ -955,7 +995,8 @@ class JiraClient:
                     "fields": ["*all", "-issuelinks"],
                     "expand": ["names", "schema"],
                 }
-                data = request_with_retry(self.session, "POST", url, json=body, **fast_fail).json()
+                resp = request_with_retry(self.session, "POST", url, json=body, **fast_fail)
+                data = _json_dict(resp, "/search page")
                 for issue in data.get("issues") or []:
                     key = issue.get("key")
                     if not key:
@@ -983,9 +1024,8 @@ class JiraClient:
                         "fields": _MINIMAL_FIELDS_LIST,
                         "expand": ["names", "schema"],
                     }
-                    data = request_with_retry(
-                        self.session, "POST", url, json=body, **fast_fail
-                    ).json()
+                    resp = request_with_retry(self.session, "POST", url, json=body, **fast_fail)
+                    data = _json_dict(resp, "/search page")
                     return data, "minimal"
                 except requests.RequestException as exc_min:
                     raise JiraFetchError(

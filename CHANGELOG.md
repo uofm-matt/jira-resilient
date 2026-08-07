@@ -2,7 +2,63 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.6.1] — 2026-08-07
+## [0.6.2] — 2026-08-07
+
+Supersedes 0.6.1, which was never published. Everything below is relative to **0.6.0**.
+
+### Added
+
+- **Python 3.11 is supported and tested.** The previous `>=3.12` floor was arbitrary — the
+  source contains no 3.12-only syntax. 3.11 is the real floor: `datetime.fromisoformat` was
+  rewritten there to accept general ISO-8601, and 3.10 rejects every timestamp shape JIRA
+  Server emits (`…+0000`, `…-0600`, `…Z`). On 3.10, `server_tz` would silently fall back to
+  UTC on every non-UTC server, so support stops at 3.11 rather than shipping a shim.
+
+### Fixed
+
+- **`list_fields` now uses the same HTTP policy as every other read.** It called
+  `session.get` directly, so a 401 raised raw `requests.HTTPError` instead of
+  `JiraAuthError`, a 503 got one attempt with no retry, and a redirect was followed —
+  including a cross-host SSO 302, whose login-page JSON was returned *as the field catalog*.
+- **A 2xx body that is not a JSON object no longer escapes the exception hierarchy.** An
+  SSO/proxy page or an error envelope decodes to a list, string or number, and reading a key
+  from it raised `AttributeError` — neither a `JiraResilientError` nor a
+  `requests.RequestException`, so it escaped both boundaries the README tells callers to
+  catch. Now `JiraParseError` on the paths that propagate, and the documented fallback on the
+  two probes that swallow.
+- **The `/myself` and `/serverInfo` probes no longer follow redirects.** `is_authenticated`
+  returned **True** against an SSO login page, and `server_tz` adopted the *login host's* UTC
+  offset — which is rendered into every delta JQL literal, shifting the minute window the
+  scan drains. 0.6.1 fixed this for `list_fields`; these were the two remaining call sites.
+- **A malformed row now fails the same way in both `search_seek` branches.** The delta path
+  has raised `JiraParseError` since 0.5.0; the full scan — the default branch — let a bare
+  `KeyError`, `ValueError` or `TypeError` escape.
+
+### Changed
+
+- `list_fields` raises `JiraParseError` when a 200 body is not a JSON list rather than
+  returning it, and any 3xx is surfaced rather than followed — including a benign 301 from
+  context-path normalisation that previously worked.
+- `list_keys` returns `[]` for the malformed body `{"issues": null}` where it previously
+  raised `TypeError`. No JIRA build emits that shape, but this is a loud failure becoming a
+  quiet one and is recorded as such rather than as tolerance.
+- `list_keys` still raises a bare `KeyError` if `/search` returns a row without `key`.
+  Deferred rather than overlooked.
+
+### Internal
+
+- The `startAt`/`total` paging loop is written once instead of four times, verified unchanged
+  by a request-level differential rather than by the tests passing.
+- **The test suite now pins behaviour, not just execution.** A mutation battery found 35 of
+  107 mutants surviving a green run at 99% coverage — a 67% mutation score. Among them: the
+  hub tier could be made to re-request `*all`, killing the feature this library exists for,
+  with every test still green; any exception could be severed from `JiraResilientError`; the
+  delta cursor could silently drop rows; and the JQL oracle guarding the 0.6.0 scope fix had
+  no oracle of its own, so the real defect plus an inverted precedence in the model cancelled
+  out. 62 tests added, 194 → 256, coverage unchanged at 99% — the point being that coverage
+  could not see any of it.
+
+## [0.6.1] — 2026-08-07 [unreleased]
 
 Cleanup and contract-fidelity release. No change to the seek paginator or the tiered fetch.
 

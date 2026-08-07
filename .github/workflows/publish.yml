@@ -2,8 +2,10 @@ name: publish
 
 on:
   push:
-    # Note: only numeric tags. Non-release `v*-locked-*` style tags used to match here and
-    # would have started a publish run.
+    # `*` matches any run of non-`/` characters, so this filter is NOT release-only: a tag
+    # like `v1-locked-2026-06-21` still matches, because `1` satisfies `[0-9]`. What stops it
+    # is the `verify-tag` job below, comparing the built version against the tag. Pushing a
+    # non-release `v…` tag therefore burns a full gate run before failing. Don't `--tags`.
     tags: ["v[0-9]*"]
 
 permissions:
