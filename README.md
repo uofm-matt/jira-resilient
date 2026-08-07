@@ -190,7 +190,7 @@ Pure functions, no network calls — for callers that want to compose JQL outsid
 
 | | Version |
 |---|---|
-| Python | 3.12+ |
+| Python | 3.11+ |
 | JIRA Server / Data Center | 8.6+ (for paginated `/issue/{key}/changelog`); older may work for non-changelog use |
 | `requests` | 2.31+ |
 
