@@ -1,8 +1,10 @@
 """Exception hierarchy for jira-resilient.
 
-All library-raised exceptions inherit from JiraResilientError, so callers can catch
-the whole family with one `except JiraResilientError` clause. Underlying
-`requests.RequestException` is wrapped (and chained via `from`) on fetch failures.
+Everything the library raises deliberately inherits from JiraResilientError, so one
+`except JiraResilientError` clause catches the family. That is NOT total coverage of what
+can escape a call: the thin endpoint wrappers let `requests.RequestException` propagate
+unwrapped (see README's error-handling section), and only the resilient paths wrap it and
+chain via `from`. Catch both if you need a hard boundary.
 """
 
 from __future__ import annotations
@@ -27,6 +29,17 @@ class JiraParseError(JiraResilientError):
 
 class JiraFetchError(JiraResilientError):
     """All retry attempts (or all fallback tiers) exhausted without success."""
+
+
+class JiraQueryValidationError(ValueError, JiraResilientError):
+    """A project key or `extra_filter` was rejected before any request was sent.
+
+    Inherits BOTH so neither kind of caller is surprised: `except ValueError` kept working
+    across 0.6.0 (these checks raised bare ValueError through 0.5.0), and
+    `except JiraResilientError` now catches it too. Before 0.6.0 the full-scan path skipped
+    these checks entirely and a bad filter surfaced as a server-side 400 (JiraJqlError), so
+    without the second base a caller guarding the family would newly see an escape.
+    """
 
 
 class JiraJqlError(JiraResilientError):

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jira-resilient"
-version = "0.5.0"
+version = "0.6.0"
 description = "Resilient JIRA Server data extraction at scale — seek pagination, reindex-aware recovery, three-tier resilient issue fetch."
 readme = "README.md"
 license = { text = "MIT" }
@@ -38,6 +38,19 @@ Issues   = "https://github.com/uofm-matt/jira-resilient/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jira_resilient"]
+
+# Allowlist, not a denylist. Hatchling excludes gitignored files but NOT untracked ones, so
+# any stray file in the repo root would otherwise ship to PyPI permanently. Tests are kept
+# so downstream packagers can run them.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/jira_resilient",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
 
 [tool.ruff]
 line-length = 100

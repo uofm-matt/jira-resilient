@@ -756,7 +756,7 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
     import re
 
     seen_jql: list[str] = []
-    universe = [{"key": f"P-{i}", "id": str(i), "fields": {}} for i in range(1, 6)]
+    universe = [{"key": f"PX-{i}", "id": str(i), "fields": {}} for i in range(1, 6)]
 
     def cb(request):
         jql = json.loads(request.body)["jql"]
@@ -772,9 +772,9 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
         callback=cb,
         content_type="application/json",
     )
-    pages = list(client.search_seek("P"))
+    pages = list(client.search_seek("PX"))
     keys = [i["key"] for p in pages for i in p.issues]
-    assert keys == ["P-1", "P-2", "P-3", "P-4", "P-5"]
+    assert keys == ["PX-1", "PX-2", "PX-3", "PX-4", "PX-5"]
     assert all("ORDER BY id ASC" in j for j in seen_jql)
     assert all("updated" not in j for j in seen_jql)
 

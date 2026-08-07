@@ -21,7 +21,11 @@ import requests
 from jira_resilient._models import ResilientFetchResult, SearchPage, Tier
 from jira_resilient.exceptions import JiraFetchError, JiraJqlError, JiraParseError
 from jira_resilient.http import make_session, request_with_retry
-from jira_resilient.jql import build_delta_minute_jql, build_next_minute_jql
+from jira_resilient.jql import (
+    build_delta_minute_jql,
+    build_full_scan_jql,
+    build_next_minute_jql,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -716,12 +720,7 @@ class JiraClient:
         caller side absorb any overlap with earlier pages.
         """
         while True:
-            jql = f'project = "{project_key}"'
-            if after_id is not None:
-                jql += f" AND id > {after_id}"
-            if extra_filter:
-                jql += f" AND {extra_filter}"
-            jql += " ORDER BY id ASC"
+            jql = build_full_scan_jql(project_key, after_id=after_id, extra_filter=extra_filter)
             data, tier = self._search_one_page(jql, page_size)
             issues = data.get("issues") or []
             if not issues:

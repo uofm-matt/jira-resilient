@@ -14,3 +14,8 @@ htmlcov/
 .mypy_cache/
 .DS_Store
 *.log
+# One machine's interpreter pin; CI decides the support matrix. Untracked files still
+# reach the sdist, so this pairs with the sdist allowlist in pyproject.toml.
+.python-version
+# Local planning artifact — strategy notes, not project documentation.
+JIRA-RESILIENT-CLI-HANDOFF.md
