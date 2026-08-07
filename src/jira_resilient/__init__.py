@@ -5,7 +5,7 @@ Quickstart:
     from jira_resilient import JiraClient
 
     client = JiraClient("https://jira.example.com", pat="...")
-    if not client.is_authenticated:
+    if not client.is_authenticated:   # a request per access — bind it, don't poll it
         raise SystemExit("auth failed")
 
     # Seek-paginated scan of a large project — survives 100K+ issue projects
@@ -17,6 +17,12 @@ Quickstart:
     # Three-tier resilient fetch (full → hub-fetch → minimal fallback)
     result = client.get_issue_resilient("HUB-1234")
     print(result.tier, result.issue["key"])
+
+The JQL builder is pure, so it runs here as written:
+
+    >>> from jira_resilient import build_jql
+    >>> build_jql("PROJ", extra_filter='status = "Done" OR labels = "nightly"')
+    'project = "PROJ" AND (status = "Done" OR labels = "nightly") ORDER BY updated ASC'
 """
 
 from jira_resilient._models import ResilientFetchResult, SearchPage, Tier

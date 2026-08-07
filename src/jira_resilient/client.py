@@ -95,16 +95,13 @@ _MINIMAL_FIELDS_LIST = _MINIMAL_FIELDS.split(",")
 class JiraClient:
     """Resilient JIRA Server REST client with seek pagination and reindex-aware recovery.
 
-    Example (illustrative only — see tests/ for live-network-free executable examples)::
+    Construction opens no connection, so the full signature is checkable offline:
 
-        from jira_resilient import JiraClient
+        >>> client = JiraClient("https://jira.example.com/", "token", timeout=60, pool_maxsize=32)
+        >>> client.base_url, client.timeout, client.max_attempts
+        ('https://jira.example.com', 60, 5)
 
-        client = JiraClient("https://jira.example.com", pat="...")
-        if not client.is_authenticated:
-            raise SystemExit("auth failed")
-        for page in client.search_seek("PROJ"):
-            for issue in page.issues:
-                ...
+    Every other method is network-bound; see tests/ for executable examples of those.
     """
 
     def __init__(
@@ -135,7 +132,13 @@ class JiraClient:
 
     @property
     def is_authenticated(self) -> bool:
-        """Probe `/rest/api/2/myself`. True iff HTTP 200. Logs the displayName on success."""
+        """Probe `/rest/api/2/myself`. True iff HTTP 200 with a JSON body.
+
+        A property that issues a request on EVERY access — nothing is cached. Bind it once
+        (`ok = client.is_authenticated`) instead of testing it per loop iteration. Never
+        raises: a 401, a network error, and an SSO login page served as 200 HTML all log and
+        return False. Logs the displayName on success.
+        """
         try:
             resp = self.session.get(f"{self.base_url}/rest/api/2/myself", timeout=30)
         except requests.RequestException as exc:
@@ -163,6 +166,12 @@ class JiraClient:
 
         Falls back to UTC if `serverTime` can't be parsed — at worst that's the same
         broken behavior callers had pre-fix.
+
+        Cached for the life of the client as a FIXED OFFSET (what `serverTime`'s suffix
+        carries), not a DST-aware zone, so a client held across a daylight-saving transition
+        keeps rendering literals at the offset it captured. Rebuild the client after one.
+        The lazy init is deliberately unlocked: racing threads each probe once and converge
+        on the same offset, and a lock on every access would cost more than the stray GET.
         """
         if self._server_tz is None:
             try:

@@ -3,8 +3,12 @@
 Everything the library raises deliberately inherits from JiraResilientError, so one
 `except JiraResilientError` clause catches the family. That is NOT total coverage of what
 can escape a call: the thin endpoint wrappers let `requests.RequestException` propagate
-unwrapped (see README's error-handling section), and only the resilient paths wrap it and
+unwrapped (see the README's "Exceptions" section), and only the resilient paths wrap it and
 chain via `from`. Catch both if you need a hard boundary.
+
+Timing is part of the contract: JiraQueryValidationError is raised PRE-FLIGHT, before any
+request is sent, so a caller guarding only the request itself misses it. JiraAuthError
+replaces the raw HTTPError for 401/403 on every path routed through `request_with_retry`.
 """
 
 from __future__ import annotations
@@ -39,6 +43,15 @@ class JiraQueryValidationError(ValueError, JiraResilientError):
     `except JiraResilientError` now catches it too. Before 0.6.0 the full-scan path skipped
     these checks entirely and a bad filter surfaced as a server-side 400 (JiraJqlError), so
     without the second base a caller guarding the family would newly see an escape.
+
+    >>> from jira_resilient.jql import build_jql
+    >>> issubclass(JiraQueryValidationError, ValueError)
+    True
+    >>> try:
+    ...     build_jql("not a project key")
+    ... except ValueError as exc:
+    ...     type(exc).__name__
+    'JiraQueryValidationError'
     """
 
 
