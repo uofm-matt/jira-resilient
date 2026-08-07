@@ -76,7 +76,11 @@ jobs:
       - run: pip install uv
       # lowest-direct on the runtime deps only: applied to the dev extra it resolves
       # pytest 8.0, which pytest-timeout cannot register against.
-      - run: uv pip install --system --resolution lowest-direct .
+      # Editable is required, not incidental: testpaths includes src/jira_resilient for
+      # --doctest-modules, so a non-editable install gives pytest two copies of every module
+      # and collection dies on "import file mismatch". Installing the built artifact is the
+      # `smoke` job's business; this job's business is the dependency floor.
+      - run: uv pip install --system --resolution lowest-direct -e .
       - run: uv pip install --system "pytest>=8" pytest-cov pytest-timeout responses
       - run: python -c "import requests, urllib3; print(requests.__version__, urllib3.__version__)"
       - run: pytest -q
