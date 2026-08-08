@@ -61,6 +61,7 @@ jobs:
         run: |
           coverage report --fail-under=97
           coverage report --include='*/client.py' --fail-under=97
+          coverage report --include='*/cli.py'    --fail-under=95
           coverage report --include='*/http.py'   --fail-under=94
 
   floor:

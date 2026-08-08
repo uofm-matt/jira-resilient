@@ -2,6 +2,41 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] — 2026-08-07
+
+### Added
+
+- **A read-only diagnostic CLI**, installed as `jira-resilient`. Two commands, deliberately.
+
+  `jira-resilient probe ISSUE-KEY` runs the three-tier ladder against one of your own issues
+  and prints what each attempt cost:
+
+  ```text
+  Full request:        Timeout after 60.0s
+  Hub base request:    success in 2.1s
+  Links-only request:  success in 181.4s
+  Tier:   hub
+  Links:  4,832
+  ```
+
+  This answers the only question that gates using this library — *do I have the hub problem?*
+  — against your own data rather than in prose. A `Tier: full` in under a second is an honest
+  "you do not need this package", which is why the command exists.
+
+  `jira-resilient scan PROJECT --limit N` is the same question over a project: tier
+  distribution, a loud warning if any page came back lossy, and whether the post-reindex
+  recovery scan fired.
+
+  The PAT is read from `JIRA_PAT` only, never an argument — a token in argv lands in shell
+  history and the process table. Nothing in the CLI writes to JIRA.
+
+- **Per-attempt timings on the resilient fetch.** `get_issue_resilient` now emits one
+  structured log record per rung of the ladder (`jr_event="attempt"` with `jr_step`,
+  `jr_elapsed`, `jr_error`). Previously the winning tier was on `ResilientFetchResult` and
+  what it cost to get there was unrecoverable — an operator could see `hub` and not that the
+  full attempt burned 60s first. Consumers read record attributes rather than parsing
+  messages, so the human-readable wording stays free to change.
+
 ## [0.6.2] — 2026-08-07
 
 Supersedes 0.6.1, which was never published. Everything below is relative to **0.6.0**.

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, tzinfo
 from typing import Any, TypedDict, TypeGuard
@@ -68,6 +69,30 @@ def _is_client_error(exc: BaseException) -> bool:
         and exc.response is not None
         and 400 <= exc.response.status_code < 500
         and exc.response.status_code != 429
+    )
+
+
+def _log_attempt(key: str, step: str, elapsed: float, exc: BaseException | None = None) -> None:
+    """One record per attempt in the resilient ladder, carrying its duration.
+
+    The winning tier is on `ResilientFetchResult`; what it cost to get there was not
+    recoverable at all — an operator could see "hub" and not that the full attempt burned
+    60s first. Emitted with structured `jr_*` fields so a consumer reads attributes rather
+    than parsing the message: `jira-resilient probe` renders the ladder from exactly these.
+    """
+    logger.info(
+        "get_issue %s: %s %s in %.1fs",
+        key,
+        step,
+        "failed" if exc else "ok",
+        elapsed,
+        extra={
+            "jr_event": "attempt",
+            "jr_key": key,
+            "jr_step": step,
+            "jr_elapsed": elapsed,
+            "jr_error": type(exc).__name__ if exc else None,
+        },
     )
 
 
@@ -629,14 +654,18 @@ class JiraClient:
         underlying exception chain.
         """
         fast_fail: _FastFail = {"timeout": 60, "max_attempts": 2}
+        t0 = time.perf_counter()
         try:
             issue = self.get_issue_raw(key, expand="names,schema", **fast_fail)
+            _log_attempt(key, "full", time.perf_counter() - t0)
             return ResilientFetchResult(issue, "full")
         except requests.RequestException as exc_full:
+            _log_attempt(key, "full", time.perf_counter() - t0, exc_full)
             if _is_client_error(exc_full):
                 raise JiraFetchError(
                     f"fetch failed for {key!r} (client error, no tier retry): {exc_full!r}"
                 ) from exc_full
+            t0 = time.perf_counter()
             try:
                 issue = self.get_issue_raw(
                     key,
@@ -644,16 +673,22 @@ class JiraClient:
                     fields="*all,-issuelinks",
                     **fast_fail,
                 )
+                _log_attempt(key, "hub-base", time.perf_counter() - t0)
+                t0 = time.perf_counter()
                 issue.setdefault("fields", {})["issuelinks"] = self.get_issuelinks(key)
+                _log_attempt(key, "hub-links", time.perf_counter() - t0)
                 logger.warning("get_issue %s degraded to hub tier (%s)", key, exc_full)
                 return ResilientFetchResult(issue, "hub")
             except requests.RequestException as exc_hub:
+                _log_attempt(key, "hub", time.perf_counter() - t0, exc_hub)
                 if _is_client_error(exc_hub):
                     raise JiraFetchError(
                         f"fetch failed for {key!r} (client error, no tier retry): {exc_hub!r}"
                     ) from exc_hub
+                t0 = time.perf_counter()
                 try:
                     issue = self.get_issue_minimal(key)
+                    _log_attempt(key, "minimal", time.perf_counter() - t0)
                     logger.warning(
                         "get_issue %s degraded to MINIMAL tier (%s) — description + "
                         "custom_fields are empty in this result",
@@ -662,6 +697,7 @@ class JiraClient:
                     )
                     return ResilientFetchResult(issue, "minimal")
                 except requests.RequestException as exc_min:
+                    _log_attempt(key, "minimal", time.perf_counter() - t0, exc_min)
                     raise JiraFetchError(
                         f"all three fetch tiers failed for {key!r}: "
                         f"full={exc_full!r}; hub={exc_hub!r}; minimal={exc_min!r}"
