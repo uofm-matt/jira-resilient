@@ -276,3 +276,21 @@ def test_a_redirect_never_becomes_an_authenticated_session_or_a_timezone(client,
     assert unprobed.is_authenticated is False
     assert unprobed.server_tz is UTC
     assert not any("sso.example.invalid" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_an_html_body_on_a_2xx_raises_inside_the_family(client, base_url):
+    """The other half of the shape guard: a body that is not JSON *at all*.
+
+    The non-object tests above all send valid JSON of the wrong type. An SSO/proxy login page
+    is HTML, which fails at decode rather than at the isinstance check — a different branch,
+    and the more likely one in the wild.
+    """
+    responses.add(
+        responses.GET,
+        f"{base_url}/rest/api/2/issue/XX-1/comment",
+        body="<html><body>Please log in</body></html>",
+        content_type="text/html",
+    )
+    with pytest.raises(JiraParseError, match="non-JSON body"):
+        client.get_comments("XX-1")

@@ -223,6 +223,49 @@ Pure functions, no network calls — for callers that want to compose JQL outsid
 | `requests` | 2.31+ |
 | `urllib3` | 2+ |
 
+## Do you actually have this problem?
+
+Installing the package gives you a read-only diagnostic command. It writes nothing.
+
+```bash
+export JIRA_URL=https://jira.example.com
+export JIRA_PAT=<personal-access-token>       # never passed as an argument
+
+jira-resilient probe HUB-1234
+```
+
+```text
+Full request:        Timeout after 60.0s
+Hub base request:    success in 2.1s
+Links-only request:  success in 181.4s
+
+Issue:  HUB-1234
+Tier:   hub
+Links:  4,832
+Fields: 61
+Wall:   243.5s over 3 attempt(s)
+
+This issue degraded to the 'hub' tier. A client without that fallback would have
+failed or hung here.
+```
+
+That is this library's entire reason to exist, measured against your own JIRA. If your issues
+come back `Tier: full` in under a second, you do not need this package — which is a useful
+answer too, and the reason `probe` exists rather than a page of prose.
+
+For a whole project rather than one issue:
+
+```bash
+jira-resilient scan PROJ --limit 500
+```
+
+reports the tier distribution, flags any pages that came back lossy, and notes whether the
+post-reindex recovery scan fired.
+
+Both commands take `--ca-bundle` for a private CA and `--insecure` for a self-signed host.
+Anything else you might want — fetching, changelogs, key listing — is three lines of Python
+against `JiraClient`; see the API reference above.
+
 ## Development
 
 ```bash
