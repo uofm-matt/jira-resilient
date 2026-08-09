@@ -263,10 +263,14 @@ def test_the_heartbeat_reports_only_what_it_can_know(env, monkeypatch):
     ticks = tty.getvalue()
     assert "nothing has finished yet" in ticks  # drawn during the tier-1 attempt
     assert "last rung: Hub base request" in ticks  # drawn during the links-only fetch
-    # Guard the guard: assert the label EXISTS before asserting the heartbeat omits it,
-    # or a rename turns this into a test that passes while checking nothing.
-    in_flight = _STEP_LABEL["hub-links"]
-    assert in_flight not in ticks, "heartbeat claimed a rung that had not finished"
+    # The property is ORDERING, not absence. Forbidding the links label outright races with a
+    # legitimate trailing tick: once links-only lands, "last rung: Links-only request" is the
+    # honest thing to draw. What must never happen is it appearing while that rung is still in
+    # flight — i.e. before the hub-base tick. CI caught the absence form failing on 3.12 only.
+    base, links = (f"last rung: {_STEP_LABEL[k]}" for k in ("hub-base", "hub-links"))
+    assert links not in ticks or ticks.index(links) > ticks.index(base), (
+        "heartbeat named the links rung before it had finished"
+    )
 
 
 @responses.activate
