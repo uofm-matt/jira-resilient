@@ -20,7 +20,12 @@ from urllib.parse import quote
 import requests
 
 from jira_resilient._models import ResilientFetchResult, SearchPage, Tier
-from jira_resilient.exceptions import JiraFetchError, JiraJqlError, JiraParseError
+from jira_resilient.exceptions import (
+    JiraAuthError,
+    JiraFetchError,
+    JiraJqlError,
+    JiraParseError,
+)
 from jira_resilient.http import make_session, request_with_retry
 from jira_resilient.jql import (
     build_delta_minute_jql,
@@ -32,13 +37,29 @@ logger = logging.getLogger(__name__)
 
 
 class _FastFail(TypedDict):
-    """The tier-1 request budget, defined once. A plain dict of these two keys cannot be
-    `**`-unpacked under a type checker: unpacking `dict[str, int]` requires the value type to
-    satisfy every remaining parameter, including `fields: str`. A TypedDict maps key by key."""
+    """The tier-1 give-up budget, resolved once per client in `JiraClient.__init__`.
+
+    Deliberately NOT `self.timeout`, and the difference is the point. Tier 1 asks for the
+    whole payload; when that payload is a hub issue's 13.6 MB the read timeout is
+    deterministic, so this budget's job is to LOSE fast enough that tier 2 — which asks for
+    something smaller — still gets to run. Honoring a 300s client timeout here would delay
+    the rescue by 300s on precisely the issues the ladder exists for. Callers who have
+    measured their own instance move it with `JiraClient(fast_fail_timeout=...)`.
+
+    A plain dict of these two keys cannot be `**`-unpacked under a type checker: unpacking
+    `dict[str, int]` requires the value type to satisfy every remaining parameter, including
+    `fields: str`. A TypedDict maps key by key.
+    """
 
     timeout: int
     max_attempts: int
 
+
+# Tier-1 defaults. 60s is not arbitrary: across ~170,000 issues on a production instance
+# only 2 exceeded it (a 3rd sat at 56.6s), so it clears >99.99% of traffic on the first
+# tier and hands the rest to a ladder that serves them better than a longer wait would.
+_FAST_FAIL_TIMEOUT = 60
+_FAST_FAIL_ATTEMPTS = 2  # one retry, then drop a tier — a third try costs more than it wins
 
 _LIST_KEYS_PAGE_SIZE = 1000  # fields=key only — tiny payload, can ask for many
 _SEARCH_SEEK_PAGE_SIZE = 20  # fields=*all + changelog — keep small to avoid timeouts
@@ -137,11 +158,38 @@ _MINIMAL_FIELDS_LIST = _MINIMAL_FIELDS.split(",")
 class JiraClient:
     """Resilient JIRA Server REST client with seek pagination and reindex-aware recovery.
 
+    `timeout` and `max_attempts` are the budget for an ordinary full read. They are NOT
+    applied everywhere, and pretending otherwise cost an operator eight minutes of silence:
+
+        `timeout` / `max_attempts`   get_issue_raw, list_keys, ?expand=changelog fallback
+        `fast_fail_timeout`          tier 1 of get_issue_resilient and of /search
+        fixed 600s                   get_issuelinks — the hub rescue, deliberately the
+                                     LONGEST budget here (a links-only fetch measured
+                                     167.2s where the full payload timed out)
+        fixed 60s / 30s              tier-3 minimal fetch, and the small sub-entity reads
+
+    `fast_fail_timeout` is separate from `timeout` because the two want opposite things:
+    a caller who sets `timeout=300` wants their hub issues fetched, while the ladder wants
+    tier 1 to quit early so tier 2 can start. Tier 2 is what actually fetches the hub issue,
+    so the ladder wins and tier 1 keeps its own short budget. It is clamped to `timeout`
+    because a tier whose job is to fail FASTER than a normal read must never wait longer
+    than one.
+
     Construction opens no connection, so the full signature is checkable offline:
 
         >>> client = JiraClient("https://jira.example.com/", "token", timeout=60, pool_maxsize=32)
         >>> client.base_url, client.timeout, client.max_attempts
         ('https://jira.example.com', 60, 5)
+        >>> client.fast_fail_timeout
+        60
+        >>> JiraClient("https://j", "t", timeout=300).fast_fail_timeout  # never raised by it
+        60
+        >>> JiraClient("https://j", "t", timeout=20).fast_fail_timeout   # but lowered by it
+        20
+        >>> JiraClient("https://j", "t", timeout=300, fast_fail_timeout=180).fast_fail_timeout
+        180
+        >>> JiraClient("https://j", "t", fast_fail_timeout=180).fast_fail_timeout  # timeout=120
+        120
 
     Every other method is network-bound; see tests/ for executable examples of those.
     """
@@ -155,10 +203,16 @@ class JiraClient:
         timeout: int = 120,
         max_attempts: int = 5,
         pool_maxsize: int = 10,
+        fast_fail_timeout: int = _FAST_FAIL_TIMEOUT,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_attempts = max_attempts
+        self.fast_fail_timeout = min(fast_fail_timeout, timeout)
+        self._fast_fail: _FastFail = {
+            "timeout": self.fast_fail_timeout,
+            "max_attempts": min(_FAST_FAIL_ATTEMPTS, max_attempts),
+        }
         # pool_maxsize: raise above the default 10 when fanning concurrent requests through this
         # client (a thread pool of N parallel GETs needs pool_maxsize >= N, else urllib3 caps live
         # connections at 10 and churns the surplus — "Connection pool is full").
@@ -182,10 +236,18 @@ class JiraClient:
         return False. Logs the displayName on success.
         """
         try:
-            resp = self.session.get(
-                f"{self.base_url}/rest/api/2/myself", timeout=30, allow_redirects=False
+            # request_with_retry, not session.get: the adapter no longer retries reads, so a
+            # direct call would give this probe no retry layer at all and one transient reset
+            # would report "not authenticated". JiraAuthError is caught below because a 401
+            # here IS the answer — this probe reports, it does not raise.
+            resp = request_with_retry(
+                self.session,
+                "GET",
+                f"{self.base_url}/rest/api/2/myself",
+                timeout=30,
+                max_attempts=2,
             )
-        except requests.RequestException as exc:
+        except (requests.RequestException, JiraAuthError) as exc:
             logger.error("Auth check error: %s", exc)
             return False
         if resp.status_code == 200:
@@ -223,19 +285,23 @@ class JiraClient:
         """
         if self._server_tz is None:
             try:
-                resp = self.session.get(
-                    f"{self.base_url}/rest/api/2/serverInfo", timeout=30, allow_redirects=False
+                # request_with_retry rather than session.get: it already refuses any 3xx (a
+                # proxy/SSO redirect's serverTime is the LOGIN host's offset, and this value
+                # is rendered into every delta JQL literal), and it is now the ONLY retry
+                # layer these probes have — the adapter stopped retrying reads. Without it a
+                # single transient reset caches UTC for the life of the client.
+                resp = request_with_retry(
+                    self.session,
+                    "GET",
+                    f"{self.base_url}/rest/api/2/serverInfo",
+                    timeout=30,
+                    max_attempts=2,
                 )
-                if 300 <= resp.status_code < 400:
-                    # Not followed, and not adopted: a proxy/SSO redirect's serverTime is the
-                    # LOGIN host's offset, and this value is rendered into every delta JQL
-                    # literal — taking it would shift the minute window the scan drains.
-                    raise ValueError(f"{resp.status_code} redirect on serverInfo (proxy/SSO?)")
-                resp.raise_for_status()
                 server_time = resp.json().get("serverTime")
                 self._server_tz = datetime.fromisoformat(server_time).tzinfo
             except (
                 requests.RequestException,
+                JiraAuthError,
                 ValueError,
                 KeyError,
                 TypeError,
@@ -653,10 +719,9 @@ class JiraClient:
         total failure with non-4xx errors raises `JiraFetchError` with the
         underlying exception chain.
         """
-        fast_fail: _FastFail = {"timeout": 60, "max_attempts": 2}
         t0 = time.perf_counter()
         try:
-            issue = self.get_issue_raw(key, expand="names,schema", **fast_fail)
+            issue = self.get_issue_raw(key, expand="names,schema", **self._fast_fail)
             _log_attempt(key, "full", time.perf_counter() - t0)
             return ResilientFetchResult(issue, "full")
         except requests.RequestException as exc_full:
@@ -671,7 +736,7 @@ class JiraClient:
                     key,
                     expand="names,schema",
                     fields="*all,-issuelinks",
-                    **fast_fail,
+                    **self._fast_fail,
                 )
                 _log_attempt(key, "hub-base", time.perf_counter() - t0)
                 t0 = time.perf_counter()
@@ -1013,11 +1078,10 @@ class JiraClient:
           - `JiraFetchError` only if all three tiers fail with non-400 errors.
         """
         url = f"{self.base_url}/rest/api/2/search"
-        fast_fail: _FastFail = {"timeout": 60, "max_attempts": 2}
         base = {"jql": jql, "startAt": start_at, "maxResults": page_size}
         try:
             body = base | {"fields": ["*all"], "expand": ["changelog", "names", "schema"]}
-            resp = request_with_retry(self.session, "POST", url, json=body, **fast_fail)
+            resp = request_with_retry(self.session, "POST", url, json=body, **self._fast_fail)
             data = _json_dict(resp, "/search page")
             return data, "full"
         except requests.RequestException as exc_full:
@@ -1031,7 +1095,7 @@ class JiraClient:
                     "fields": ["*all", "-issuelinks"],
                     "expand": ["names", "schema"],
                 }
-                resp = request_with_retry(self.session, "POST", url, json=body, **fast_fail)
+                resp = request_with_retry(self.session, "POST", url, json=body, **self._fast_fail)
                 data = _json_dict(resp, "/search page")
                 for issue in data.get("issues") or []:
                     key = issue.get("key")
@@ -1060,7 +1124,9 @@ class JiraClient:
                         "fields": _MINIMAL_FIELDS_LIST,
                         "expand": ["names", "schema"],
                     }
-                    resp = request_with_retry(self.session, "POST", url, json=body, **fast_fail)
+                    resp = request_with_retry(
+                        self.session, "POST", url, json=body, **self._fast_fail
+                    )
                     data = _json_dict(resp, "/search page")
                     return data, "minimal"
                 except requests.RequestException as exc_min:

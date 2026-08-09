@@ -18,11 +18,16 @@ Quickstart:
     result = client.get_issue_resilient("HUB-1234")
     print(result.tier, result.issue["key"])
 
-The JQL builder is pure, so it runs here as written:
+The JQL helpers are pure, so they run here as written. `build_jql` returns a runnable
+query; `project_clause` returns the WHERE fragment to conjoin into one of your own,
+instead of hand-rolling `f'project = "{key}" AND {filter}'` and losing the parentheses
+that keep a top-level `OR` from escaping the project scope:
 
-    >>> from jira_resilient import build_jql
+    >>> from jira_resilient import build_jql, project_clause
     >>> build_jql("PROJ", extra_filter='status = "Done" OR labels = "nightly"')
     'project = "PROJ" AND (status = "Done" OR labels = "nightly") ORDER BY updated ASC'
+    >>> project_clause("PROJ", 'status = "Done" OR labels = "nightly"')
+    'project = "PROJ" AND (status = "Done" OR labels = "nightly")'
 """
 
 from jira_resilient._models import ResilientFetchResult, SearchPage, Tier
@@ -34,9 +39,9 @@ from jira_resilient.exceptions import (
     JiraParseError,
     JiraResilientError,
 )
-from jira_resilient.jql import build_jql
+from jira_resilient.jql import build_jql, project_clause
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "JiraAuthError",
@@ -50,4 +55,5 @@ __all__ = [
     "Tier",
     "__version__",
     "build_jql",
+    "project_clause",
 ]
