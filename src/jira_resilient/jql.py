@@ -2,6 +2,11 @@
 
 These are pure functions — no network calls, no state. They live separately from
 the JiraClient class so callers can compose JQL outside of any request flow.
+
+Two public shapes, and the distinction is the point. `project_clause` returns a WHERE
+fragment for callers assembling a query of their own; `build_jql` returns that fragment
+plus `ORDER BY updated ASC`, i.e. something runnable. A trailing `ORDER BY` is the marker
+throughout this module: if a string has one it is a query, if it does not it is a piece.
 """
 
 from __future__ import annotations
@@ -43,6 +48,43 @@ def _check_extra_filter(extra_filter: str) -> None:
         )
 
 
+def project_clause(project_key: str, extra_filter: str | None = None) -> str:
+    """Scope a filter to one project. Returns a WHERE fragment — no `ORDER BY`, not a query.
+
+    This is the composition primitive. Reach for it whenever you would otherwise write
+    `f'project = "{key}" AND {filter}'`: that spelling drops both validators and, worse,
+    leaves a top-level `OR` unparenthesized. JQL binds `AND` tighter than `OR`, so
+    `project = "P" AND a OR b` parses as `(project = "P" AND a) OR b` and returns rows from
+    EVERY project. Two separate downstream files hand-rolled that exact string and shipped
+    that exact defect, which is why this function is exported and the cursor builders below
+    are not — theirs is one page of a paging protocol whose correctness lives in the caller,
+    while this one's whole contract is local and visible in its own return value.
+
+    Conjoin the result with `AND`, or append an `ORDER BY` of your own. Do NOT append
+    ` OR ...`: that unbinds the project clause again. Put the `OR` inside `extra_filter`,
+    where it gets parenthesized.
+
+    Deliberately unordered. Ordering belongs to whoever runs the query, and an offset-paged
+    scan needs a deterministic one (`search_seek` supplies its own — prefer it over paging
+    this by hand).
+
+    >>> project_clause("PROJ")
+    'project = "PROJ"'
+    >>> project_clause("PROJ", 'status = "Done" OR labels = "nightly"')
+    'project = "PROJ" AND (status = "Done" OR labels = "nightly")'
+    >>> project_clause("PROJ", None) == project_clause("PROJ", "")
+    True
+    >>> f = 'status = "Done"'
+    >>> build_jql("PROJ", extra_filter=f) == f'{project_clause("PROJ", f)} ORDER BY updated ASC'
+    True
+    """
+    _check_project_key(project_key)
+    if not extra_filter:
+        return f'project = "{project_key}"'
+    _check_extra_filter(extra_filter)
+    return f'project = "{project_key}" AND ({extra_filter})'
+
+
 def build_jql(
     project_key: str,
     *,
@@ -51,6 +93,11 @@ def build_jql(
     tz: tzinfo | None = None,
 ) -> str:
     """Build a project-scoped JQL with optional `updated >=` clause + extra filter.
+
+    A complete, runnable query: the trailing `ORDER BY updated ASC` is part of what this
+    returns. If you want the WHERE half alone — to conjoin into a query of your own, or to
+    give it an ordering this one does not — use `project_clause`, which is exactly this
+    minus the sort and minus the `updated` cursor.
 
     `updated_after` accepts ISO-8601 strings or `datetime` instances; JQL only honors
     minute precision, so values are truncated to 16 chars.
@@ -89,7 +136,9 @@ def _fmt_jql_ts(ts: str | datetime, tz: tzinfo | None) -> str:
 # scan, and the scan's correctness lives in the paging protocol that calls them
 # (`JiraClient._search_by_id` / `._search_by_updated`), not in any single JQL string. Called
 # standalone each returns a plausible-looking first page, which is exactly why none of them
-# is in `__all__` — exporting one invites a caller to use it as a whole query.
+# is in `__all__` — exporting one invites a caller to use it as a whole query. `project_clause`
+# is exported under the same rule, not despite it: it carries no cursor and no protocol, so
+# there is no second half for a caller to be missing.
 #
 # The delta pair is minute-scoped rather than one `(updated, key)` JQL because JQL's
 # `updated` *sort* is second-precision while a bare minute date LITERAL is the INSTANT

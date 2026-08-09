@@ -3,17 +3,29 @@
 Deliberately NOT tested: that argparse parses arguments. `probe` earns its place only if it
 reports what each attempt cost against a server that degrades, so every test here drives a
 real `JiraClient` through mocked HTTP and reads what the user would see on stdout.
+
+The heartbeat tests need requests that actually take wall-clock time, so they use a
+`responses` callback that blocks on an `Event` — `time.sleep` is stubbed out for the whole
+module (the retry backoff would otherwise cost minutes) and would make a slow attempt fast.
 """
 
 from __future__ import annotations
 
+import io
+import json
+import logging
+import sys
+import threading
 import time
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import requests
 import responses
 
-from jira_resilient.cli import main
+from jira_resilient import cli
+from jira_resilient.cli import _STEP_LABEL, main
 
 _ISSUE = "https://jira.example.com/rest/api/2/issue/HUB-1"
 _ENV = {"JIRA_URL": "https://jira.example.com", "JIRA_PAT": "secret-token"}
@@ -24,6 +36,39 @@ def env(monkeypatch: pytest.MonkeyPatch) -> None:
     for k, v in _ENV.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(time, "sleep", lambda _: None)
+
+
+class _Tty(io.StringIO):
+    """A stderr that claims to be a terminal, which is what switches the heartbeat on."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _terminal_stderr(monkeypatch: pytest.MonkeyPatch) -> _Tty:
+    """Give `probe` a terminal-shaped stderr, and a tick fast enough for a 0.15s request.
+
+    Called from the test body rather than supplied as a fixture on purpose: pytest re-installs
+    its own `sys.stdout`/`sys.stderr` when it resumes capture for the call phase, so the same
+    patch applied during fixture setup is silently undone before the test runs.
+    """
+    stream = _Tty()
+    monkeypatch.setattr(sys, "stderr", stream)
+    monkeypatch.setattr(cli, "_TICK_SECONDS", 0.01)
+    return stream
+
+
+def _slow(delay: float, result: Any) -> Callable[[Any], Any]:
+    """A `responses` callback that blocks for `delay` and then succeeds — or, when handed an
+    exception, raises it (which is how `responses` models a transport failure)."""
+
+    def callback(_request: Any) -> Any:
+        threading.Event().wait(delay)
+        if isinstance(result, Exception):
+            return result
+        return (200, {}, json.dumps(result))
+
+    return callback
 
 
 @responses.activate
@@ -170,3 +215,141 @@ def test_scan_exits_nonzero_when_the_scan_fails(env, capsys):
 
     assert main(["scan", "PROJ"]) == 1
     assert "Scan failed" in capsys.readouterr().out
+
+
+@responses.activate
+def test_the_heartbeat_ticks_while_a_request_is_still_in_flight(env, monkeypatch):
+    """The measured failure this exists for: 504s inside one attempt, nothing on the terminal.
+
+    The attempt records fire at COMPLETION, so during the slowest thing `probe` does there is
+    nothing to report but the clock — and a clock that moves is the whole difference between
+    "working" and "hung".
+    """
+    tty = _terminal_stderr(monkeypatch)
+    responses.add_callback(
+        responses.GET,
+        _ISSUE,
+        callback=_slow(0.15, {"key": "HUB-1", "fields": {}}),
+        content_type="application/json",
+    )
+
+    assert main(["probe", "HUB-1"]) == 0
+    ticks = tty.getvalue()
+    assert ticks.count("\r") > 2  # redrawn in place, repeatedly, during one request
+    assert "elapsed" in ticks and "in flight" in ticks
+
+
+@responses.activate
+def test_the_heartbeat_reports_only_what_it_can_know(env, monkeypatch):
+    """Before a rung lands it says so, and after one lands it names that rung — never the one
+    currently running, which the ladder does not announce until it is over."""
+    tty = _terminal_stderr(monkeypatch)
+    responses.add_callback(
+        responses.GET,
+        _ISSUE,
+        callback=_slow(0.15, requests.exceptions.Timeout("read timeout")),
+        content_type="application/json",
+    )
+    responses.add(responses.GET, _ISSUE, body=requests.exceptions.Timeout("read timeout"))
+    responses.add(responses.GET, _ISSUE, json={"key": "HUB-1", "fields": {}})
+    responses.add_callback(
+        responses.GET,
+        _ISSUE,
+        callback=_slow(0.15, {"fields": {"issuelinks": []}}),
+        content_type="application/json",
+    )
+
+    assert main(["probe", "HUB-1"]) == 0
+    ticks = tty.getvalue()
+    assert "nothing has finished yet" in ticks  # drawn during the tier-1 attempt
+    assert "last rung: Hub base request" in ticks  # drawn during the links-only fetch
+    # The property is ORDERING, not absence. Forbidding the links label outright races with a
+    # legitimate trailing tick: once links-only lands, "last rung: Links-only request" is the
+    # honest thing to draw. What must never happen is it appearing while that rung is still in
+    # flight — i.e. before the hub-base tick. CI caught the absence form failing on 3.12 only.
+    base, links = (f"last rung: {_STEP_LABEL[k]}" for k in ("hub-base", "hub-links"))
+    assert links not in ticks or ticks.index(links) > ticks.index(base), (
+        "heartbeat named the links rung before it had finished"
+    )
+
+
+@responses.activate
+def test_each_rung_prints_before_the_next_request_is_issued(env, capsys):
+    """Streaming, asserted from inside the ladder rather than after it.
+
+    Reading stdout from a mid-ladder request is the only way to tell "printed as it happened"
+    from "printed at the end in the same order".
+    """
+    mid_ladder: list[str] = []
+    for _ in range(2):
+        responses.add(responses.GET, _ISSUE, body=requests.exceptions.Timeout("read timeout"))
+
+    def watch(_request):
+        mid_ladder.append(capsys.readouterr().out)
+        return (200, {}, json.dumps({"key": "HUB-1", "fields": {}}))
+
+    responses.add_callback(responses.GET, _ISSUE, callback=watch, content_type="application/json")
+    responses.add(responses.GET, _ISSUE, json={"fields": {"issuelinks": []}})
+
+    assert main(["probe", "HUB-1"]) == 0
+    assert "Full request:" in mid_ladder[0]
+    assert "Timeout" in mid_ladder[0]
+
+
+@responses.activate
+def test_the_heartbeat_stays_off_when_stderr_is_not_a_terminal(env, capsys):
+    """A carriage-returned line is noise in a log file. The report still streams to stdout —
+    that is the durable record, and it does not depend on anyone watching."""
+    responses.add_callback(
+        responses.GET,
+        _ISSUE,
+        callback=_slow(0.05, {"key": "HUB-1", "fields": {}}),
+        content_type="application/json",
+    )
+
+    assert main(["probe", "HUB-1"]) == 0
+    captured = capsys.readouterr()
+    assert "\r" not in captured.err
+    assert "Full request:" in captured.out
+
+
+@responses.activate
+def test_a_rung_that_succeeded_is_not_reported_as_failed_when_a_later_one_fails(env, capsys):
+    """The all-tiers-failed path used to render every record as `failed`, so a hub base that
+    came back in 15s read as a failure. One renderer for both paths is why it cannot now."""
+    for _ in range(2):  # tier 1: two attempts, both time out
+        responses.add(responses.GET, _ISSUE, body=requests.exceptions.Timeout("read timeout"))
+    responses.add(responses.GET, _ISSUE, json={"key": "HUB-1", "fields": {}})  # hub base: OK
+    for _ in range(5):  # links-only (2) then minimal (3), all timing out
+        responses.add(responses.GET, _ISSUE, body=requests.exceptions.Timeout("read timeout"))
+
+    assert main(["probe", "HUB-1"]) == 1
+    out = capsys.readouterr().out
+    assert "Hub base request:" in out and "success in" in out
+    assert "All tiers failed" in out
+
+
+def test_the_http_layer_s_retry_warnings_still_reach_the_console(env):
+    """Collecting the attempt records means lowering the library logger to INFO, and the fix
+    for the INFO records then leaking is to pin the console handler at WARNING. Both halves
+    are asserted here: the retry notices — the only output that explains WHY a request is
+    slow — must survive that pinning, and the raw INFO records must not.
+    """
+    console = io.StringIO()
+    handler = logging.StreamHandler(console)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, _ISSUE, status=500)
+            rsps.add(responses.GET, _ISSUE, json={"key": "HUB-1", "fields": {}})
+            assert main(["probe", "HUB-1"]) == 0
+    finally:
+        root.removeHandler(handler)
+
+    printed = console.getvalue()
+    # Asserts the LEVEL reaches the console, not the wording — http.py is free to
+    # rephrase. Pinning the message text is the coupling _AttemptLog exists to avoid.
+    assert "WARNING" in printed
+    assert "INFO" not in printed

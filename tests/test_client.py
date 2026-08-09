@@ -311,7 +311,7 @@ def test_search_seek_post_reindex_falls_back_to_id_scan(client, base_url):
 
 
 @responses.activate
-def test_search_seek_delta_raises_parse_error_on_missing_id(client, base_url):
+def test_search_seek_delta_raises_parse_error_on_missing_id(client, base_url, no_sleep):
     """The delta drain advances on `id`, so a drain row missing it is unrecoverable."""
     responses.add(
         responses.POST,
@@ -785,12 +785,17 @@ def test_search_seek_full_scans_by_id_ignoring_updated(client, base_url):
 
 
 @responses.activate
-def test_server_tz_falls_back_to_utc_on_probe_failure(client, base_url):
+def test_server_tz_falls_back_to_utc_on_probe_failure(client, base_url, no_sleep):
     """When the /serverInfo probe fails, server_tz must fall back to UTC — not the
     machine's local timezone. (Regression: the old code used the local TZ, which is
-    silently wrong anywhere the host clock isn't UTC, e.g. a non-UTC cloud region.)"""
+    silently wrong anywhere the host clock isn't UTC, e.g. a non-UTC cloud region.)
+
+    Takes no_sleep because the probe now retries: the adapter stopped retrying reads, so
+    this is the only retry layer it has, and a 5xx costs a real backoff without it.
+    """
     from datetime import UTC
 
+    responses.add(responses.GET, f"{base_url}/rest/api/2/serverInfo", status=500)
     responses.add(responses.GET, f"{base_url}/rest/api/2/serverInfo", status=500)
     assert client.server_tz is UTC
 

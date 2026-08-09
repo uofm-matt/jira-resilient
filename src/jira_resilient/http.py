@@ -10,8 +10,8 @@ SINGLE authority for HTTP-status retries (429 + 5xx) and Retry-After (capped):
     - 429              — rate limited, backoff respecting Retry-After (capped).
     - 5xx (500/502/503/504) — transient server, backoff respecting Retry-After (capped).
     - Network errors   — connection-level retries (adapter) + app-level backoff.
-The adapter retries connection/read errors only — it does NOT retry HTTP statuses, so
-there is exactly one place that interprets Retry-After and one cap.
+The adapter retries CONNECT errors only — not HTTP statuses (so there is exactly one place
+that interprets Retry-After and one cap) and not read timeouts (see `_RETRY`).
 """
 
 from __future__ import annotations
@@ -61,11 +61,39 @@ class _TLSAdapter(HTTPAdapter):
         return super().proxy_manager_for(*args, **kwargs)
 
 
-# Connection-level retry ONLY (connect/read errors). HTTP-status retries (429/5xx) and
-# the single capped Retry-After authority live in `request_with_retry`, so the adapter
-# never sleeps on a status or a Retry-After header.
+# CONNECT-level retry only. HTTP-status retries (429/5xx) and the single capped
+# Retry-After authority live in `request_with_retry`, so the adapter never sleeps on a
+# status or a Retry-After header.
+#
+# `read=False` is the load-bearing half, and it is a silent multiplier if you omit it.
+# urllib3 charges a read error to `read` and a connect error to `connect`, with `total`
+# capping the sum — `total` does not override either counter. So this keeps all 3 connect
+# retries (a refused connect still costs 4 attempts) while a read timeout costs exactly 1.
+#
+# Why read timeouts specifically must NOT be retried here: on this API a read timeout is
+# usually DETERMINISTIC, not transient. It means JIRA is still serializing a payload too
+# big to finish in the budget — one hub issue measured 13.6 MB and 206s for a single
+# GET. Retrying asks the same server for the same oversized payload and waits the same
+# budget again, three more times. That is how a 60s tier-1 budget cost 504s in production:
+# 2 app attempts x (4 reads x 60s + 6s of urllib3 backoff) + 10s app backoff = 502s. The
+# three-tier ladder's whole job is to ask for something SMALLER, and it only gets to do
+# that if tier 1 gives up on schedule (measured after: 130s).
+#
+# `False` rather than `0`: both stop after one attempt, but `0` exhausts the counter and
+# surfaces `requests.exceptions.ConnectionError` wrapping a MaxRetryError, while `False`
+# re-raises the original and surfaces `requests.exceptions.ReadTimeout`. Both are
+# `RequestException`, so the tier ladders behave identically; only `False` tells a caller
+# reading the exception what actually happened.
+#
+# This is not a new regime — it is GET catching up to POST. urllib3 only retries read
+# errors for methods in `Retry.DEFAULT_ALLOWED_METHODS`, which excludes POST, so every
+# `/search` request this library has ever issued already took one read attempt per
+# app-level attempt. The cost is bounded and measured: a mid-flight connection abort
+# (urllib3 classes that as a read error too) on a GET now recovers via `request_with_retry`
+# after its 10s backoff instead of instantly at the adapter. POST has always paid that 10s.
 _RETRY = Retry(
     total=3,
+    read=False,
     status_forcelist=[],
     backoff_factor=1,
     respect_retry_after_header=False,

@@ -1,13 +1,13 @@
 # jira-resilient
 
-> A Python client for **JIRA Server** that reliably extracts issues with **thousands of issuelinks** — the "hub" issues that consistently time out and break other clients. Built for ETL / data-warehouse workloads where missing data isn't an option.
+> A Python client for **JIRA Server** that reliably extracts issues with **thousands of issuelinks** — the "hub" issues that time out and break other clients. Rare, and unrecoverable when you hit one: on a measured 170,000-issue instance, two issues could not be fetched by an ordinary request at all. Built for ETL / data-warehouse workloads where missing data isn't an option.
 
 [![PyPI](https://img.shields.io/pypi/v/jira-resilient.svg)](https://pypi.org/project/jira-resilient/)
 [![Python](https://img.shields.io/pypi/pyversions/jira-resilient.svg)](https://pypi.org/project/jira-resilient/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/uofm-matt/jira-resilient/test.yml?branch=main&label=tests)](https://github.com/uofm-matt/jira-resilient/actions/workflows/test.yml)
 
-In any large JIRA Server install, a handful of "hub" issues accumulate enormous numbers of `Implements` / `Tests` / `Relates` links — easily into the thousands. A real-world example: a single issue with **many thousands of issuelinks**. The standard `GET /issue/{key}?fields=*all` for that issue returns a ~10 MB payload that takes JIRA 3+ minutes to serialize — well past every existing Python client's default timeout. Result: the issue is silently absent from the warehouse, no error, no retry that would help.
+In any large JIRA Server install, a handful of "hub" issues accumulate enormous numbers of `Implements` / `Tests` / `Relates` links — easily into the thousands. A real-world example: a single issue with **many thousands of issuelinks**. The standard `GET /issue/{key}?fields=*all` for that issue returns a **13.6 MB** payload that takes JIRA **206 seconds** to serialize (measured, see below) — well past most clients' default timeout. Result: the issue is silently absent from the warehouse, no error, no retry that would help.
 
 This library exists to solve that. The fix is a three-tier fetch that recognizes the timeout pattern and recovers data via split requests:
 
@@ -89,11 +89,50 @@ In a project with a few thousand issues, you might have 5–10 hub issues out of
 
 Three reasons existing clients can't handle this:
 
-1. **`fields=*all` returns everything inline.** A multi-thousand-link issue is a ~10 MB JSON payload. JIRA's serializer is single-threaded per request and takes minutes; clients with a 60s or 120s timeout just see a `ReadTimeoutError`.
-2. **There's no documented escape hatch.** JIRA Server has no "give me this issue but skip the slow fields" endpoint. You have to know to request `fields=*all,-issuelinks` and then fetch `issuelinks` separately with a longer timeout — and even then, the issuelinks-only request can take 3+ minutes for the largest hubs.
+1. **`fields=*all` returns everything inline.** A multi-thousand-link issue is a 13.6 MB JSON payload. JIRA's serializer is single-threaded per request; a 60s or 120s timeout just sees a `ReadTimeoutError`.
+2. **There's no documented escape hatch.** JIRA Server has no "give me this issue but skip the slow fields" endpoint. You have to know to request `fields=*all,-issuelinks` and then fetch `issuelinks` separately with a longer timeout — and even then, the issuelinks-only request took 167s for the largest hub measured.
 3. **Retrying doesn't help.** Exponential backoff over the same broken request just wastes time. You need a fundamentally different fetch pattern, not more attempts.
 
 `get_issue_resilient` implements that pattern. Ordinary issues come back on the first tier (`full`); hub issues fall to the split fetch (`hub`, no data loss, but minutes rather than seconds); anything that defeats both lands on the minimal field set (`minimal`, lossy — description and custom fields are empty). The mix is instance-specific, which is what the `tier` field is for: log it and measure your own.
+
+### Measured, on a real instance
+
+One production JIRA Server, ~170,000 issues. Same issue, same host, minutes apart:
+
+| | result |
+|---|---|
+| `GET /issue/X?fields=*all` | **HTTP 200 in 206.1s, 13,603,108 bytes** |
+| the same fetch at a 120s timeout | **failed** (and took 487s to do it — see below) |
+| tiered: full attempt | failed |
+| tiered: `*all,-issuelinks` | 15.2s |
+| tiered: issuelinks only | 167.2s |
+
+Cost per link, across the same instance:
+
+| links | wall | ms/link |
+|---|---|---|
+| 106 | 0.8s | 7.5 |
+| 816 | 8.2s | 10.0 |
+| 2,073 | 23.7s | 11.4 |
+| 4,754 | 56.6s | 11.9 |
+| 8,249 | 206.1s | **25.0** |
+
+Serialization is superlinear above ~5,000 links — the last row costs more than twice per link
+what the row above it does. That is the whole shape of the problem: nothing degrades gently,
+and the issue that breaks is the one nobody was watching.
+
+**Two of ~170,000 issues exceeded a 60s budget.** That is a small number and there is no point
+dressing it up. Both were requirement roots — the issues a traceability matrix is built on, and
+hubs precisely *because* everything traces to them. A third sat at 56.6s against 60s, which is
+not passing so much as pre-failing; links only accumulate.
+
+**A naive client with a 300s timeout would also fetch these.** Worth saying plainly. What it
+would not do is fail fast on the other 169,998: raising a global timeout raises it for every
+request, and a dead endpoint then takes 300s × the adapter's retries to report. The tiered path
+spends 60s on everything and reserves the long budget for the one sub-request that needs it.
+
+If your issues all come back `Tier: full` in under a second, you do not need this library. Run
+`jira-resilient probe` against your own worst issue and find out.
 
 ### The Lucene reindex story
 
@@ -107,7 +146,7 @@ The fix: the delta scan never paginates *across* a minute on `updated`. It drain
 
 ## API reference
 
-`JiraClient(base_url, pat, *, verify=True, timeout=120, max_attempts=5, pool_maxsize=10)`
+`JiraClient(base_url, pat, *, verify=True, timeout=120, max_attempts=5, pool_maxsize=10, fast_fail_timeout=60)`
 
 | Parameter | Default | Notes |
 |---|---|---|

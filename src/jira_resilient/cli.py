@@ -6,6 +6,10 @@ one of your own issues and printing what each attempt cost. A 3-minute links fet
 whole thesis; a `full` tier in 0.4s is an honest "you don't need this". `scan` is the same
 question over a project rather than one issue.
 
+Both commands split the two streams the same way: **stdout is the report** (the thing you
+redirect into a file or paste into a ticket) and **stderr is progress** (the thing that tells
+you it is still alive). Nothing on stderr is needed to read the result.
+
 Everything else a user might want (fetching, changelogs, key listing) is three lines of
 Python against `JiraClient`, and a wrapper for it would be surface to maintain without
 teaching anything. See the README.
@@ -20,26 +24,131 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from typing import Self, TextIO
 
 from jira_resilient import JiraClient, JiraResilientError, __version__
 
 _ENV_URL = "JIRA_URL"
 _ENV_PAT = "JIRA_PAT"
 
+# Heartbeat redraw interval. Measured worst case is a single attempt that runs 504s, so the
+# tick is there to be glanced at, not read; 2s is slow enough to be quiet and fast enough
+# that someone who has just pressed Enter sees the clock move before they doubt it.
+_TICK_SECONDS = 2.0
+
+# A plain alias rather than a PEP 695 `type` statement: the package floor is Python 3.11.
+_Sink = Callable[[str, float, str | None], None]
+
+
+class _Progress:
+    """The heartbeat `probe` ticks on stderr while a request is in flight.
+
+    Measured against a production instance: one hub issue's tier-1 attempt did not fail until
+    504s, and the whole probe took 11 minutes, during which the terminal showed nothing at
+    all. Every structured record the ladder emits fires at attempt COMPLETION, so the slowest
+    thing this command does is exactly the thing it could not report on — working and hung
+    looked identical.
+
+    Elapsed time is the only honest content. `requests` hands back no body until the response
+    is complete, and these minutes are the server's serializer rather than transfer, so there
+    is no byte count or percentage to show that would not be invented. A predicted deadline is
+    equally unavailable: the tier budget is chosen inside `get_issue_resilient`, not taken
+    from `--timeout`, so a countdown rendered here would be a guess wearing a fact's clothes.
+    Likewise the rung currently in flight — the ladder announces a rung only once it is over,
+    and naming the next one from the count of finished ones is inference, which is how a
+    progress display starts lying.
+
+    It owns the terminal for the duration, which is why report lines go out through `report`
+    rather than straight to `print`: stdout landing on top of a half-drawn tick is the one way
+    this could make output worse rather than better. WARNING records (the HTTP layer's retry
+    notices) still belong to whatever handler `main` configured; those arrive complete with a
+    newline, so the worst they do is push the tick down a line, and the next tick redraws.
+
+    Disabled when stderr is not a terminal. A carriage-returned line is noise in a log file,
+    and the report lines — the durable record — stream to stdout either way.
+    """
+
+    def __init__(self, label: str, stream: TextIO, *, enabled: bool, interval: float) -> None:
+        self.label = label
+        self.stream = stream
+        self.enabled = enabled
+        self.interval = interval
+        # Re-entrant: `completed` clears the line and prints while already holding it.
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start = self._since = time.perf_counter()
+        self._last: str | None = None
+        self._drawn = False
+
+    def __enter__(self) -> Self:
+        if self.enabled:
+            self._thread = threading.Thread(target=self._tick, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        self._clear()
+
+    def report(self, line: str) -> None:
+        """Print one line of the report to stdout, without the heartbeat smearing it."""
+        with self._lock:
+            self._clear()
+            print(line, flush=True)
+
+    def completed(self, label: str, line: str) -> None:
+        """A rung finished: print its line and restart the in-flight clock under it."""
+        with self._lock:
+            self.report(line)
+            self._since, self._last = time.perf_counter(), label
+
+    def _tick(self) -> None:
+        # Draw first, then wait, so the first frame lands immediately rather than one
+        # interval into a request that may run for eight minutes.
+        while not self._stop.is_set():
+            with self._lock:
+                self.stream.write(f"\r  {self._status()}\x1b[K")
+                self.stream.flush()
+                self._drawn = True
+            self._stop.wait(self.interval)
+
+    def _status(self) -> str:
+        now = time.perf_counter()
+        rung = f"last rung: {self._last}" if self._last else "nothing has finished yet"
+        return (
+            f"{self.label}  {now - self._start:.0f}s elapsed | "
+            f"{now - self._since:.0f}s in flight | {rung}"
+        )
+
+    def _clear(self) -> None:
+        with self._lock:
+            if not self._drawn:
+                return
+            self.stream.write("\r\x1b[K")
+            self.stream.flush()
+            self._drawn = False
+
 
 class _AttemptLog(logging.Handler):
-    """Collects the structured attempt records `get_issue_resilient` emits.
+    """Collects the structured attempt records `get_issue_resilient` emits, and forwards
+    each one to `sink` as it lands — which is what makes the report stream instead of
+    appearing all at once when the ladder returns.
 
     Reads `record.jr_*` attributes rather than parsing the formatted message, so changing
     the human-readable wording cannot break this.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sink: _Sink) -> None:
         super().__init__(level=logging.INFO)
+        self.sink = sink
         self.attempts: list[tuple[str, float, str | None]] = []
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -52,11 +161,12 @@ class _AttemptLog(logging.Handler):
         elapsed: float = getattr(record, "jr_elapsed", 0.0)
         error: str | None = getattr(record, "jr_error", None)
         self.attempts.append((step, elapsed, error))
+        self.sink(step, elapsed, error)
 
 
 @contextmanager
-def _collect_attempts() -> Iterator[_AttemptLog]:
-    handler = _AttemptLog()
+def _collect_attempts(sink: _Sink) -> Iterator[_AttemptLog]:
+    handler = _AttemptLog(sink)
     log = logging.getLogger("jira_resilient")
     previous, log.level = log.level, min(log.level or logging.INFO, logging.INFO)
     log.addHandler(handler)
@@ -84,24 +194,29 @@ def _client(args: argparse.Namespace) -> JiraClient:
 
 
 def probe(args: argparse.Namespace) -> int:
-    """Run the resilient ladder against one issue and report what each attempt cost."""
+    """Run the resilient ladder against one issue and report what each attempt cost.
+
+    The rungs print as they land rather than after the ladder returns. Same lines in the same
+    order — but a tier-1 timeout that takes 504s is now visible when it happens, and one
+    renderer serves both the success and the all-tiers-failed path, so a rung that SUCCEEDED
+    before a later one failed can no longer be reported as "failed" on the way out.
+    """
     client = _client(args)
-    with _collect_attempts() as collected:
+    progress = _Progress(args.key, sys.stderr, enabled=sys.stderr.isatty(), interval=_TICK_SECONDS)
+
+    def rung(step: str, elapsed: float, error: str | None) -> None:
+        label = _STEP_LABEL.get(step, step)
+        outcome = f"{error} after {elapsed:.1f}s" if error else f"success in {elapsed:.1f}s"
+        progress.completed(label, f"{label + ':':<20} {outcome}")
+
+    with progress, _collect_attempts(rung) as collected:
         started = time.perf_counter()
         try:
             result = client.get_issue_resilient(args.key)
         except JiraResilientError as exc:
-            for step, elapsed, error in collected.attempts:
-                print(
-                    f"{_STEP_LABEL.get(step, step) + ':':<20} {error or 'failed'} after {elapsed:.1f}s"
-                )
-            print(f"\nAll tiers failed: {exc}")
+            progress.report(f"\nAll tiers failed: {exc}")
             return 1
         wall = time.perf_counter() - started
-
-    for step, elapsed, error in collected.attempts:
-        outcome = f"{error} after {elapsed:.1f}s" if error else f"success in {elapsed:.1f}s"
-        print(f"{_STEP_LABEL.get(step, step) + ':':<20} {outcome}")
 
     links = (result.issue.get("fields") or {}).get("issuelinks")
     print(f"\nIssue:  {args.key}")
@@ -186,6 +301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # propagation is gated by handler levels rather than ancestor logger levels. So once
     # `_collect_attempts` lowers the library logger to INFO, every attempt record would also
     # reach the console — printing the raw instrumentation above the report rendered from it.
+    # Pinning at WARNING rather than silencing the console is deliberate: the HTTP layer's
+    # retry notices are the only thing besides the heartbeat that anyone can see during a
+    # long attempt, and they say WHY it is slow, which the heartbeat cannot.
     for handler in logging.getLogger().handlers:
         handler.setLevel(logging.WARNING)
     result: int = args.func(args)

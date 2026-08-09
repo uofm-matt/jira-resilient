@@ -2,6 +2,55 @@
 
 All notable changes will be documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] — 2026-08-08
+
+Everything here came from running the library against a real 170,000-issue JIRA Server for the
+first time. Four defects that desk design had missed.
+
+### Added
+
+- **`project_clause(project_key, extra_filter)`**, exported. The composition primitive that was
+  missing: it validates both arguments and parenthesizes the filter, so `AND a OR b` cannot
+  unbind the project scope. The cursor builders stay unexported — their correctness lives in the
+  paging protocol that calls them — but this one's whole contract is its return value.
+  It exists because two separate downstream files hand-rolled
+  `f'project = "{key}" AND {filter}'` and shipped exactly the defect 0.6.0 had just fixed. The
+  library held the fix and made it unreachable; that was an encapsulation failure, not theirs.
+
+- **`probe` now reports progress while it runs.** A heartbeat on stderr with elapsed time and the
+  last completed rung, suppressed when stderr is not a terminal. Previously it printed nothing
+  for 11 minutes on a real hub issue — a diagnostic about slow requests giving no way to tell
+  working from hung.
+
+- **`fast_fail_timeout` on `JiraClient`** (default 60). The tier budget is now configurable and
+  the constructor's `timeout` clamps it.
+
+### Fixed
+
+- **The adapter no longer retries read timeouts.** `Retry(total=3)` applied to every request, so
+  each app-level attempt was really four HTTP attempts and the "fast-fail" tier-1 budget cost
+  **504 seconds** against production, not the 120 its parameters imply. A connection failure is
+  transient and still retries; a read timeout on a 13.6 MB payload is deterministic and now
+  costs one attempt. Measured: the tier-1 budget drops from ~504s to ~130s.
+
+- **`JiraClient(timeout=...)` reaches the tier ladders.** It previously did not: both
+  `get_issue_resilient` and `_search_one_page` hardcoded 60s, so a caller who knew they had hub
+  issues and configured for it silently got 60 seconds.
+
+- **`is_authenticated` and `server_tz` retry again.** They call the session directly, so the
+  adapter was their only retry layer; removing read retries would have left them with none. One
+  transient reset made `server_tz` cache UTC **for the life of the client**, rendering every
+  delta JQL literal at the wrong offset, silently. Both now use `request_with_retry`, which also
+  gives them its redirect refusal.
+
+### Documentation
+
+- The README's payload and timing claims were estimates ("~10 MB", "3+ minutes"). They are now
+  measured: **13.6 MB and 206 seconds**, with the full cost-per-link curve and the point where
+  serialization stops being linear. The subtitle no longer says hub issues "consistently" time
+  out — on the instance measured, two issues in 170,000 did, and the honest number is more
+  useful than the loud one.
+
 ## [0.7.0] — 2026-08-07
 
 ### Added

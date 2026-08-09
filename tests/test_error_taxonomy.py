@@ -26,7 +26,7 @@ def _delta(client):
 
 
 @responses.activate
-def test_is_authenticated_network_error_is_false(client, base_url):
+def test_is_authenticated_network_error_is_false(client, base_url, no_sleep):
     responses.add(
         responses.GET, f"{base_url}/rest/api/2/myself", body=requests.ConnectionError("boom")
     )
