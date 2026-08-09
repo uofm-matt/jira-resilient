@@ -33,9 +33,11 @@ first time. Four defects that desk design had missed.
   transient and still retries; a read timeout on a 13.6 MB payload is deterministic and now
   costs one attempt. Measured: the tier-1 budget drops from ~504s to ~130s.
 
-- **`JiraClient(timeout=...)` reaches the tier ladders.** It previously did not: both
-  `get_issue_resilient` and `_search_one_page` hardcoded 60s, so a caller who knew they had hub
-  issues and configured for it silently got 60 seconds.
+- **The tier budget is reachable at all.** Both ladders hardcoded 60s, so it could not be
+  changed by any caller. It is now `fast_fail_timeout` (default 60), and the constructor's
+  `timeout` **clamps** it — `timeout=30` gives the ladder 30s. Note that `timeout` does not
+  RAISE it: `timeout=300` still leaves tier 1 at 60s, because failing fast is what lets tier 2
+  run. To give tier 1 longer, set `fast_fail_timeout` explicitly.
 
 - **`is_authenticated` and `server_tz` retry again.** They call the session directly, so the
   adapter was their only retry layer; removing read retries would have left them with none. One

@@ -151,9 +151,10 @@ The fix: the delta scan never paginates *across* a minute on `updated`. It drain
 | Parameter | Default | Notes |
 |---|---|---|
 | `verify` | `True` | `True` = system CAs, a path = custom CA bundle, `False` = skip verification. The TLS 1.2 floor holds either way |
-| `timeout` | `120` | Seconds, applied to `get_issue_raw`, `list_keys`, and the `?expand=changelog` fallback. The tiered fetch/search paths and the sub-entity reads use their own fixed budgets (30-600s) |
+| `timeout` | `120` | Seconds, applied to `get_issue_raw`, `list_keys`, and the `?expand=changelog` fallback. The tiered paths use `fast_fail_timeout` (which this clamps); the sub-entity reads use their own fixed budgets (30-600s) |
 | `max_attempts` | `5` | Same three paths as `timeout`. Retries cover 429 and 5xx only; other 4xx fail fast and 3xx is rejected, never followed |
 | `pool_maxsize` | `10` | Per-host connection pool size. Raise it to your thread count before fanning out — see Thread safety |
+| `fast_fail_timeout` | `60` | Budget for **tier 1** of the resilient fetch and search ladders — the attempt that is *meant* to give up so the split fetch can run. `timeout` clamps this down (`timeout=30` gives tier 1 30s) but does **not** raise it: `timeout=300` still leaves tier 1 at 60s. Raise this instead, and only if you want tier 1 to keep trying on a payload that is already too large |
 
 ### Thread safety
 
